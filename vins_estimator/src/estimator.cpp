@@ -489,7 +489,42 @@ bool Estimator::visualInitialAlign()
         Vs[i] = rot_diff * Vs[i];
     }
     ROS_DEBUG_STREAM("g0     " << g.transpose());
-    ROS_DEBUG_STREAM("my R0  " << Utility::R2ypr(Rs[0]).transpose()); 
+    ROS_DEBUG_STREAM("my R0  " << Utility::R2ypr(Rs[0]).transpose());
+
+    // Post-init gravity-direction sanity (hover-aware fix).
+    //
+    // The visual-inertial alignment can converge to a gravity vector that is
+    // off-direction when the motion during init was weak (near-zero parallax,
+    // rank-deficient linear system). When that happens, the estimator reports
+    // a finished init but the residual (g_true - g_est) integrates into
+    // position at ~0.5·|Δg|·t² — a few seconds later the pose "flies off"
+    // tens of metres and triggers `big z translation` → reboot.
+    //
+    // When the stationarity detector has held for long enough to have clean
+    // IMU samples, we know the gravity direction exactly in the IMU frame:
+    // mean(acc) = R_wb^T · g_world (because V=0 and bias is primed small).
+    // Compare against the recovered `Rs[0]^T · g` and reject init if the
+    // angular mismatch is too large. A retry on the next frame gets another
+    // chance with fresher visual constraints.
+    if (STATIC_INIT_BIAS_PRIMING && motion_detector.isStationary() &&
+        motion_detector.imuCount() >= 20)
+    {
+        Vector3d g_body_expected = motion_detector.meanAcc();       // what IMU reads when still
+        Vector3d g_body_recovered = Rs[0].transpose() * g;          // what our init says gravity is in body frame
+        if (g_body_expected.norm() > 1e-3 && g_body_recovered.norm() > 1e-3)
+        {
+            double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
+            if (cos_a > 1.0)  cos_a = 1.0;
+            if (cos_a < -1.0) cos_a = -1.0;
+            double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
+            if (angle_deg > 8.0)
+            {
+                ROS_WARN("init rejected: gravity direction mismatch %.1f deg", angle_deg);
+                return false;
+            }
+            ROS_INFO("init gravity check OK (%.1f deg)", angle_deg);
+        }
+    }
 
     return true;
 }
@@ -514,7 +549,13 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 
             }
             average_parallax = 1.0 * sum_parallax / int(corres.size());
-            if(average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
+            // Hover-aware: lowered from 30 -> 18 "px". 30 px required ~5-6 cm
+            // translation at 1 m feature distance (f≈565) before init would
+            // engage — users had to actively wave the device. 18 px needs
+            // ~3 cm, which hand tremor + small takeoff lift supplies, yet
+            // still keeps the essential-matrix problem well-conditioned
+            // (RANSAC solveRelativeRT still has to pass).
+            if(average_parallax * 460 > 18 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
                 l = i;
                 ROS_DEBUG("average_parallax %f choose l %d and newest frame to triangulate the whole structure", average_parallax * 460, l);
@@ -679,6 +720,19 @@ bool Estimator::failureDetection()
     // optimization steps should not reboot the whole estimator — ZUPT will
     // pull drift back in. Soften the translation triggers accordingly.
     const bool hover_soften = SOFTEN_FAILURE_ON_HOVER && motion_detector.isStationary();
+
+    // Runaway guard (hover-aware). When sensors say we are stationary but the
+    // estimator's velocity is large, we have a bad state (typically a bad
+    // init that produced a misaligned gravity vector — position is about to
+    // explode over the next few seconds). Force reboot irrespective of the
+    // soften flag; ZUPT cannot recover this once the linearisation point is
+    // off.
+    if (motion_detector.isStationary() && Vs[WINDOW_SIZE].norm() > 0.5)
+    {
+        ROS_WARN(" runaway while stationary: |V|=%.2f m/s — forcing reboot",
+                 Vs[WINDOW_SIZE].norm());
+        return true;
+    }
 
     if (f_manager.last_track_num < 2)
     {
