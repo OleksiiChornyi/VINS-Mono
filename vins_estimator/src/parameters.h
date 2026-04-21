@@ -50,6 +50,13 @@ extern double STATIC_HOLD_SEC;
 extern int    STATIC_INIT_BIAS_PRIMING;
 extern int    SOFTEN_FAILURE_ON_HOVER;
 extern double HOVER_MIN_PARALLAX_FACTOR;
+extern double INIT_MAX_VELOCITY;
+extern double GRAVITY_CHECK_ANGLE_DEG;
+extern int    ENABLE_ROTATION_ZUPT;
+extern double ROTATION_ZUPT_GYR_MIN;
+extern double ROTATION_ZUPT_FLOW_RATIO;
+extern double ROTATION_ZUPT_FLOW_BASELINE;
+extern double ROTATION_ZUPT_POS_WEIGHT;
 
 
 void readParameters(ros::NodeHandle &n);

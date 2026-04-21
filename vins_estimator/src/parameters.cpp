@@ -34,6 +34,13 @@ double STATIC_HOLD_SEC;
 int    STATIC_INIT_BIAS_PRIMING;
 int    SOFTEN_FAILURE_ON_HOVER;
 double HOVER_MIN_PARALLAX_FACTOR;
+double INIT_MAX_VELOCITY;
+double GRAVITY_CHECK_ANGLE_DEG;
+int    ENABLE_ROTATION_ZUPT;
+double ROTATION_ZUPT_GYR_MIN;
+double ROTATION_ZUPT_FLOW_RATIO;
+double ROTATION_ZUPT_FLOW_BASELINE;
+double ROTATION_ZUPT_POS_WEIGHT;
 
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
@@ -170,10 +177,21 @@ void readParameters(ros::NodeHandle &n)
     STATIC_INIT_BIAS_PRIMING = readOrInt("static_init_bias_priming", 1);
     SOFTEN_FAILURE_ON_HOVER  = readOrInt("soften_failure_on_hover",  1);
     HOVER_MIN_PARALLAX_FACTOR = readOr  ("hover_min_parallax_factor", 0.5);
+    INIT_MAX_VELOCITY           = readOr   ("init_max_velocity",           3.0);
+    GRAVITY_CHECK_ANGLE_DEG     = readOr   ("gravity_check_angle_deg",     8.0);
+    ENABLE_ROTATION_ZUPT        = readOrInt("enable_rotation_zupt",        1);
+    ROTATION_ZUPT_GYR_MIN       = readOr   ("rotation_zupt_gyr_min",       0.3);
+    ROTATION_ZUPT_FLOW_RATIO    = readOr   ("rotation_zupt_flow_ratio",    1.3);
+    ROTATION_ZUPT_FLOW_BASELINE = readOr   ("rotation_zupt_flow_baseline", 30.0);
+    ROTATION_ZUPT_POS_WEIGHT    = readOr   ("rotation_zupt_pos_weight",    500.0);
 
     ROS_INFO("hover-aware: zupt=%d (v=%.1f p=%.1f) acc_thr=%.3f gyr_thr=%.3f flow_thr=%.2f hold=%.2fs",
              ENABLE_ZUPT, ZUPT_VEL_WEIGHT, ZUPT_POS_WEIGHT,
              STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR, STATIC_HOLD_SEC);
+    ROS_INFO("hover-aware: init_vmax=%.1f m/s, g_check=%.1f deg, rot_zupt=%d (gyr_min=%.2f, ratio=%.2f, baseline=%.0fpx, w=%.0f)",
+             INIT_MAX_VELOCITY, GRAVITY_CHECK_ANGLE_DEG,
+             ENABLE_ROTATION_ZUPT, ROTATION_ZUPT_GYR_MIN, ROTATION_ZUPT_FLOW_RATIO,
+             ROTATION_ZUPT_FLOW_BASELINE, ROTATION_ZUPT_POS_WEIGHT);
 
     fsSettings.release();
 }

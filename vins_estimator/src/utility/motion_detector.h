@@ -1,18 +1,33 @@
 #pragma once
 
 #include <deque>
+#include <cmath>
 #include <eigen3/Eigen/Dense>
 
-// Rolling-window stationarity detector fusing IMU variance with optical-flow
-// magnitude. Used by the estimator to trigger Zero-Velocity Updates (ZUPT),
-// prime bias/gravity estimates during init, and soften failure detection
-// while the drone is stationary at altitude (hover scenario).
+// Rolling-window motion classifier used by the hover-aware fork.
 //
-// Decision rule: "stationary" = for at least `hold_sec` continuous seconds,
-//   - accelerometer magnitude deviates from gravity by < acc_thr
-//   - gyro magnitude stays below gyr_thr
-//   - mean optical flow over the window stays below flow_thr (px/sec)
-// If no flow samples have arrived yet, the IMU-only criteria apply.
+// Answers three related questions about the last window_sec seconds:
+//
+//   1. isStationary()   — accelerometer ≈ gravity, gyro ≈ 0, flow ≈ 0.
+//                         Gates ZUPT, static-init bias priming, and failure
+//                         softening.
+//
+//   2. isRotationOnly(focal_px) — gyroscope shows significant angular rate
+//                         but the optical flow is explainable by rotation
+//                         alone (no residual translational flow). True for
+//                         a handheld device being panned/tilted in place,
+//                         or a drone yawing at a stationary hover point.
+//                         Used to apply a position-only ZUPT when VIO's
+//                         translation estimate would otherwise drift due
+//                         to extrinsic calibration errors leaking rotation
+//                         into translation.
+//
+//   3. hasStationaryReference() / stationaryReferenceAcc() — the most
+//                         recent meanAcc observed while isStationary() was
+//                         true. Survives the transition out of stationary,
+//                         so a post-init gravity-direction sanity check
+//                         can run AGAINST this reference even when init
+//                         completes during takeoff motion.
 class MotionDetector
 {
 public:
@@ -21,6 +36,7 @@ public:
           is_still_(false),
           last_t_(-1.0),
           last_flow_t_(-1.0),
+          have_still_ref_(false),
           acc_thr_(0.5),
           gyr_thr_(0.05),
           flow_thr_(2.0),
@@ -48,6 +64,8 @@ public:
         is_still_      = false;
         last_t_        = -1.0;
         last_flow_t_   = -1.0;
+        have_still_ref_ = false;
+        still_ref_acc_.setZero();
     }
 
     void pushIMU(double t, const Eigen::Vector3d &acc, const Eigen::Vector3d &gyr)
@@ -67,16 +85,12 @@ public:
 
     bool isStationary() const { return is_still_; }
 
-    // Duration (seconds) the system has been continuously stationary, 0 when
-    // moving. Used to gate transitions that should only trigger after holding
-    // still for a while (e.g. ZUPT weight ramp, static init).
     double stationaryDuration() const
     {
         if (first_still_t_ < 0 || last_t_ < 0) return 0.0;
         return last_t_ - first_still_t_;
     }
 
-    // Mean gyro over current window. Good estimator for Bg when stationary.
     Eigen::Vector3d meanGyr() const
     {
         Eigen::Vector3d s = Eigen::Vector3d::Zero();
@@ -85,8 +99,6 @@ public:
         return s / double(imu_buf_.size());
     }
 
-    // Mean acc over current window. When stationary this equals R_wb^T * g,
-    // so it gives the gravity direction in the IMU frame.
     Eigen::Vector3d meanAcc() const
     {
         Eigen::Vector3d s = Eigen::Vector3d::Zero();
@@ -95,7 +107,75 @@ public:
         return s / double(imu_buf_.size());
     }
 
+    // Mean angular-rate magnitude (not magnitude of mean — different when
+    // gyro has DC bias). Used by rotation-only classifier.
+    double meanGyrMagnitude() const
+    {
+        if (imu_buf_.empty()) return 0.0;
+        double s = 0.0;
+        for (const auto &e : imu_buf_) s += e.gyr.norm();
+        return s / double(imu_buf_.size());
+    }
+
+    // Peak |acc - g| seen over the window. Non-zero during motor spin-up
+    // and sharp thrust transients; used by init to recognise "we are in
+    // a takeoff event" and apply stricter acceptance criteria.
+    double peakAccDeviation() const
+    {
+        double m = 0.0;
+        for (const auto &e : imu_buf_)
+        {
+            double d = std::fabs(e.acc.norm() - gravity_norm_);
+            if (d > m) m = d;
+        }
+        return m;
+    }
+
+    double meanFlow() const
+    {
+        if (flow_buf_.empty()) return 0.0;
+        double s = 0.0;
+        for (const auto &e : flow_buf_) s += e.second;
+        return s / double(flow_buf_.size());
+    }
+
     int imuCount() const { return (int)imu_buf_.size(); }
+    int flowCount() const { return (int)flow_buf_.size(); }
+
+    // Last meanAcc sampled while the detector was confirmed stationary.
+    // Valid for the entire session once the device has been held still
+    // at any point (typical: pre-arm on the ground).
+    bool hasStationaryReference() const { return have_still_ref_; }
+    const Eigen::Vector3d& stationaryReferenceAcc() const { return still_ref_acc_; }
+
+    // Pure rotation classifier.
+    //
+    // Intuition: for a rigid rotation at angular rate ω with no translation,
+    // the optical flow of an off-centre feature is approximately |ω|·f (in
+    // pixels/sec), where f is the focal length. Translational flow is
+    // (|v|/depth)·f; for handheld distances (~1–3 m) even small translation
+    // produces flow comparable to rotational flow, so the ratio discriminates
+    // rotation-only from general motion.
+    //
+    //   flow_measured < ratio · |ω|·f + baseline
+    // is the acceptance rule. ratio ~ 1.3 is forgiving to feature depth
+    // spread; baseline absorbs tracker noise at low ω.
+    //
+    // Gated on |ω| > gyr_min to avoid misclassifying slow translation as
+    // rotation-dominated (where division/ratio thresholds become unstable).
+    bool isRotationOnly(double focal_px, double gyr_min_rad_s,
+                        double flow_ratio, double flow_baseline_px) const
+    {
+        if (imu_buf_.size() < 4) return false;
+        if (flow_buf_.empty())   return false;  // need visual evidence
+
+        double mean_gyr_mag = meanGyrMagnitude();
+        if (mean_gyr_mag < gyr_min_rad_s) return false;
+
+        double predicted_flow = mean_gyr_mag * focal_px;
+        double measured_flow  = meanFlow();
+        return measured_flow < flow_ratio * predicted_flow + flow_baseline_px;
+    }
 
 private:
     struct ImuSample { double t; Eigen::Vector3d acc; Eigen::Vector3d gyr; };
@@ -143,6 +223,16 @@ private:
         {
             if (first_still_t_ < 0) first_still_t_ = last_t_;
             is_still_ = (last_t_ - first_still_t_) >= hold_sec_;
+
+            // Cache meanAcc the moment we confirm stationary — this is the
+            // most accurate gravity-in-body-frame measurement we will ever
+            // get, and it stays valid as a reference after the drone starts
+            // moving.
+            if (is_still_)
+            {
+                still_ref_acc_ = meanAcc();
+                have_still_ref_ = true;
+            }
         }
         else
         {
@@ -158,6 +248,10 @@ private:
     bool   is_still_;
     double last_t_;
     double last_flow_t_;
+
+    // Sticky reference — last meanAcc while confirmed stationary.
+    bool   have_still_ref_;
+    Eigen::Vector3d still_ref_acc_;
 
     double acc_thr_;
     double gyr_thr_;

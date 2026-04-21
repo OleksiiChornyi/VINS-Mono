@@ -495,35 +495,61 @@ bool Estimator::visualInitialAlign()
     //
     // The visual-inertial alignment can converge to a gravity vector that is
     // off-direction when the motion during init was weak (near-zero parallax,
-    // rank-deficient linear system). When that happens, the estimator reports
-    // a finished init but the residual (g_true - g_est) integrates into
-    // position at ~0.5·|Δg|·t² — a few seconds later the pose "flies off"
-    // tens of metres and triggers `big z translation` → reboot.
+    // rank-deficient linear system), or when init completes during a sharp
+    // takeoff transient. When that happens, the estimator reports a finished
+    // init but the residual (g_true - g_est) integrates into position at
+    // ~0.5·|Δg|·t² — a few seconds later the pose "flies off" tens of metres.
     //
-    // When the stationarity detector has held for long enough to have clean
-    // IMU samples, we know the gravity direction exactly in the IMU frame:
-    // mean(acc) = R_wb^T · g_world (because V=0 and bias is primed small).
-    // Compare against the recovered `Rs[0]^T · g` and reject init if the
-    // angular mismatch is too large. A retry on the next frame gets another
-    // chance with fresher visual constraints.
-    if (STATIC_INIT_BIAS_PRIMING && motion_detector.isStationary() &&
-        motion_detector.imuCount() >= 20)
+    // Reference gravity direction: prefer the currently stationary meanAcc,
+    // otherwise fall back to the last-known stationary reference (cached in
+    // the detector from a prior still moment — typically pre-arm on the
+    // ground). The fallback is what makes this check effective during
+    // takeoff inits, where the detector is no longer stationary right at
+    // the moment visualInitialAlign finishes.
+    if (STATIC_INIT_BIAS_PRIMING)
     {
-        Vector3d g_body_expected = motion_detector.meanAcc();       // what IMU reads when still
-        Vector3d g_body_recovered = Rs[0].transpose() * g;          // what our init says gravity is in body frame
-        if (g_body_expected.norm() > 1e-3 && g_body_recovered.norm() > 1e-3)
+        Vector3d g_body_expected = Vector3d::Zero();
+        const char *src = nullptr;
+        if (motion_detector.isStationary() && motion_detector.imuCount() >= 20)
         {
-            double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
-            if (cos_a > 1.0)  cos_a = 1.0;
-            if (cos_a < -1.0) cos_a = -1.0;
-            double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
-            if (angle_deg > 8.0)
-            {
-                ROS_WARN("init rejected: gravity direction mismatch %.1f deg", angle_deg);
-                return false;
-            }
-            ROS_INFO("init gravity check OK (%.1f deg)", angle_deg);
+            g_body_expected = motion_detector.meanAcc();
+            src = "live";
         }
+        else if (motion_detector.hasStationaryReference())
+        {
+            g_body_expected = motion_detector.stationaryReferenceAcc();
+            src = "cached";
+        }
+
+        if (src && g_body_expected.norm() > 1e-3)
+        {
+            Vector3d g_body_recovered = Rs[0].transpose() * g;
+            if (g_body_recovered.norm() > 1e-3)
+            {
+                double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
+                if (cos_a > 1.0)  cos_a = 1.0;
+                if (cos_a < -1.0) cos_a = -1.0;
+                double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
+                if (angle_deg > GRAVITY_CHECK_ANGLE_DEG)
+                {
+                    ROS_WARN("init rejected: gravity mismatch %.1f deg (ref=%s)", angle_deg, src);
+                    return false;
+                }
+                ROS_INFO("init gravity check OK %.1f deg (ref=%s)", angle_deg, src);
+            }
+        }
+    }
+
+    // Post-init velocity sanity. A plausible takeoff lift is ≲ 2 m/s; any
+    // freshly-initialised frame with |V| far above that implies a degenerate
+    // alignment — the state will explode on the next predict step. Reject
+    // and retry rather than let failureDetection pick it up several frames
+    // (and several metres) later.
+    if (Vs[WINDOW_SIZE].norm() > INIT_MAX_VELOCITY)
+    {
+        ROS_WARN("init rejected: |V|=%.2f m/s exceeds %.2f m/s plausibility cap",
+                 Vs[WINDOW_SIZE].norm(), INIT_MAX_VELOCITY);
+        return false;
     }
 
     return true;
@@ -861,6 +887,38 @@ void Estimator::optimization()
             problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[j]);
         }
         ROS_DEBUG("hover ZUPT active: span=%d frames", WINDOW_SIZE - start_idx + 1);
+    }
+    // Rotation-only ZUPT: pin position when motion is pure rotation.
+    //
+    // Handheld testing or in-place yaw produces large optical flow from
+    // rotation alone. Tiny residuals in R_cam←imu extrinsic calibration
+    // leak that rotation into apparent translation in the factor graph —
+    // position drifts metres per minute even though the drone body has not
+    // actually moved. Detecting "pure rotation" lets us anchor position
+    // without touching velocity (so the gyro-driven rotation updates
+    // unimpeded through IMU preintegration).
+    //
+    // Classifier compares measured optical flow against what |ω|·f predicts
+    // (see MotionDetector::isRotationOnly). Gated by gyr>min to avoid
+    // firing during low-motion drift. Only position pseudo-measurement is
+    // added — not velocity — because during rotation Vs can legitimately
+    // be non-zero through bias/noise but Pj≈Pi must hold regardless.
+    else if (ENABLE_ROTATION_ZUPT &&
+             motion_detector.isRotationOnly(FOCAL_LENGTH,
+                                            ROTATION_ZUPT_GYR_MIN,
+                                            ROTATION_ZUPT_FLOW_RATIO,
+                                            ROTATION_ZUPT_FLOW_BASELINE))
+    {
+        const int zupt_span = 2;
+        const int start_idx = std::max(0, WINDOW_SIZE - zupt_span);
+        for (int i = start_idx; i < WINDOW_SIZE; i++)
+        {
+            int j = i + 1;
+            auto *zp = new ZUPTPositionFactor(ROTATION_ZUPT_POS_WEIGHT);
+            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[j]);
+        }
+        ROS_DEBUG("rotation ZUPT active: |gyr|=%.2f flow=%.1f px/s",
+                  motion_detector.meanGyrMagnitude(), motion_detector.meanFlow());
     }
 
     int f_m_cnt = 0;
