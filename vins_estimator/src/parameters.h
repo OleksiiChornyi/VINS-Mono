@@ -38,6 +38,19 @@ extern int ESTIMATE_TD;
 extern int ROLLING_SHUTTER;
 extern double ROW, COL;
 
+// Hover-aware extensions (see config/*.yaml for defaults).
+extern int    ENABLE_ZUPT;
+extern double ZUPT_VEL_WEIGHT;
+extern double ZUPT_POS_WEIGHT;
+extern double STATIC_ACC_THR;
+extern double STATIC_GYR_THR;
+extern double STATIC_FLOW_THR;
+extern double STATIC_WINDOW_SEC;
+extern double STATIC_HOLD_SEC;
+extern int    STATIC_INIT_BIAS_PRIMING;
+extern int    SOFTEN_FAILURE_ON_HOVER;
+extern double HOVER_MIN_PARALLAX_FACTOR;
+
 
 void readParameters(ros::NodeHandle &n);
 

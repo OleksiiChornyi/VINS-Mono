@@ -17,6 +17,9 @@ void Estimator::setParameter()
     ProjectionFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
     ProjectionTdFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
     td = TD;
+
+    motion_detector.configure(STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR,
+                              STATIC_WINDOW_SEC, STATIC_HOLD_SEC, G.norm());
 }
 
 void Estimator::clearState()
@@ -79,10 +82,20 @@ void Estimator::clearState()
 
     drift_correct_r = Matrix3d::Identity();
     drift_correct_t = Vector3d::Zero();
+
+    motion_detector.reset();
+    last_image_t = -1.0;
+    imu_clock = 0.0;
 }
 
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
 {
+    // Feed stationarity detector with raw IMU. processIMU is called with
+    // relative dt only, so we accumulate our own clock for the rolling
+    // window; the clock resets together with the detector in clearState().
+    imu_clock += dt;
+    motion_detector.pushIMU(imu_clock, linear_acceleration, angular_velocity);
+
     if (!first_imu)
     {
         first_imu = true;
@@ -121,6 +134,29 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
+
+    // Feed optical-flow magnitude to the stationarity detector. feature
+    // velocities are normalized image-plane units per second, so multiplying
+    // by FOCAL_LENGTH converts them back to pixels/sec — the natural unit
+    // for a threshold that should be scene-independent.
+    {
+        double flow_sum = 0.0;
+        int    flow_cnt = 0;
+        for (const auto &id_pts : image)
+        {
+            for (const auto &cam_pt : id_pts.second)
+            {
+                double vx = cam_pt.second(5);
+                double vy = cam_pt.second(6);
+                flow_sum += std::sqrt(vx * vx + vy * vy);
+                flow_cnt++;
+            }
+        }
+        double avg_flow_px = (flow_cnt > 0) ? (flow_sum / flow_cnt) * FOCAL_LENGTH : 0.0;
+        motion_detector.pushFlow(header.stamp.toSec(), avg_flow_px);
+    }
+    last_image_t = header.stamp.toSec();
+
     if (f_manager.addFeatureCheckParallax(frame_count, image, td))
         marginalization_flag = MARGIN_OLD;
     else
@@ -245,6 +281,25 @@ bool Estimator::initialStructure()
             ROS_INFO("IMU excitation not enouth!");
             //return false;
         }
+    }
+
+    // Static-aware init priming: when the stationarity detector confirms the
+    // drone has been held still, use mean(gyr) as the gyro-bias prior. Under
+    // hover this is a very accurate estimate (gyro output = bias when the
+    // rate is zero), and it gives solveGyroscopeBias a much better seed than
+    // zero when SfM-derived rotations are near-identity.
+    if (STATIC_INIT_BIAS_PRIMING && motion_detector.isStationary())
+    {
+        Vector3d primed_bg = motion_detector.meanGyr();
+        for (int i = 0; i <= WINDOW_SIZE; i++) Bgs[i] = primed_bg;
+        for (int i = 1; i <= WINDOW_SIZE; i++)
+            if (pre_integrations[i] != nullptr)
+                pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+        for (auto &kv : all_image_frame)
+            if (kv.second.pre_integration != nullptr)
+                kv.second.pre_integration->repropagate(Vector3d::Zero(), primed_bg);
+        ROS_INFO("static-init bias priming: Bg = [%.5f, %.5f, %.5f]",
+                 primed_bg.x(), primed_bg.y(), primed_bg.z());
     }
     // global sfm
     Quaterniond Q[frame_count + 1];
@@ -620,6 +675,11 @@ void Estimator::double2vector()
 
 bool Estimator::failureDetection()
 {
+    // During confirmed hover, short-lived position excursions from noisy
+    // optimization steps should not reboot the whole estimator — ZUPT will
+    // pull drift back in. Soften the translation triggers accordingly.
+    const bool hover_soften = SOFTEN_FAILURE_ON_HOVER && motion_detector.isStationary();
+
     if (f_manager.last_track_num < 2)
     {
         ROS_INFO(" little feature %d", f_manager.last_track_num);
@@ -645,13 +705,21 @@ bool Estimator::failureDetection()
     Vector3d tmp_P = Ps[WINDOW_SIZE];
     if ((tmp_P - last_P).norm() > 5)
     {
-        ROS_INFO(" big translation");
-        return true;
+        if (hover_soften) {
+            ROS_WARN(" big translation during hover — soften, not rebooting (norm %.2f)", (tmp_P - last_P).norm());
+        } else {
+            ROS_INFO(" big translation");
+            return true;
+        }
     }
     if (abs(tmp_P.z() - last_P.z()) > 1)
     {
-        ROS_INFO(" big z translation");
-        return true; 
+        if (hover_soften) {
+            ROS_WARN(" big z translation during hover — soften, not rebooting (dz %.2f)", tmp_P.z() - last_P.z());
+        } else {
+            ROS_INFO(" big z translation");
+            return true;
+        }
     }
     Matrix3d tmp_R = Rs[WINDOW_SIZE];
     Matrix3d delta_R = tmp_R.transpose() * last_R;
@@ -716,6 +784,31 @@ void Estimator::optimization()
         IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
         problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
     }
+
+    // Zero-Velocity Update: when the drone has been holding still, inject
+    // pseudo-measurements that pin velocity to zero and position to its
+    // previous value. Under hover the VIO geometry is degenerate — ZUPT is
+    // what physically anchors the state so IMU bias integration cannot drive
+    // the pose away. Only applied to the newest few frames, all guaranteed
+    // to fall inside the detector's confirmed stationary window.
+    if (ENABLE_ZUPT && motion_detector.isStationary())
+    {
+        const int zupt_span = 3;
+        const int start_idx = std::max(0, WINDOW_SIZE - zupt_span);
+        for (int j = start_idx; j <= WINDOW_SIZE; j++)
+        {
+            auto *zv = new ZUPTVelocityFactor(ZUPT_VEL_WEIGHT);
+            problem.AddResidualBlock(zv, NULL, para_SpeedBias[j]);
+        }
+        for (int i = start_idx; i < WINDOW_SIZE; i++)
+        {
+            int j = i + 1;
+            auto *zp = new ZUPTPositionFactor(ZUPT_POS_WEIGHT);
+            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[j]);
+        }
+        ROS_DEBUG("hover ZUPT active: span=%d frames", WINDOW_SIZE - start_idx + 1);
+    }
+
     int f_m_cnt = 0;
     int feature_index = -1;
     for (auto &it_per_id : f_manager.feature)

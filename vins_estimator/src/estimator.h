@@ -17,6 +17,8 @@
 #include "factor/projection_factor.h"
 #include "factor/projection_td_factor.h"
 #include "factor/marginalization_factor.h"
+#include "factor/zupt_factor.h"
+#include "utility/motion_detector.h"
 
 #include <unordered_map>
 #include <queue>
@@ -136,4 +138,10 @@ class Estimator
     Vector3d relo_relative_t;
     Quaterniond relo_relative_q;
     double relo_relative_yaw;
+
+    // Hover-aware state: stationarity detector driving ZUPT, static init
+    // priming, and softened failure detection.
+    MotionDetector motion_detector;
+    double last_image_t;
+    double imu_clock;
 };

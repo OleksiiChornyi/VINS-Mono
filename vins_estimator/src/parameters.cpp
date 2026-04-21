@@ -23,6 +23,18 @@ std::string IMU_TOPIC;
 double ROW, COL;
 double TD, TR;
 
+int    ENABLE_ZUPT;
+double ZUPT_VEL_WEIGHT;
+double ZUPT_POS_WEIGHT;
+double STATIC_ACC_THR;
+double STATIC_GYR_THR;
+double STATIC_FLOW_THR;
+double STATIC_WINDOW_SEC;
+double STATIC_HOLD_SEC;
+int    STATIC_INIT_BIAS_PRIMING;
+int    SOFTEN_FAILURE_ON_HOVER;
+double HOVER_MIN_PARALLAX_FACTOR;
+
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
 {
@@ -132,6 +144,36 @@ void readParameters(ros::NodeHandle &n)
     {
         TR = 0;
     }
-    
+
+    // Hover-aware extensions. Every field is optional and falls back to a
+    // default tuned for a small multirotor hovering at altitude — the
+    // scenario where vanilla VINS-Mono drifts the most.
+    auto readOr = [&](const char *key, double def) -> double {
+        cv::FileNode n = fsSettings[key];
+        if (n.empty() || (!n.isReal() && !n.isInt())) return def;
+        return static_cast<double>(n);
+    };
+    auto readOrInt = [&](const char *key, int def) -> int {
+        cv::FileNode n = fsSettings[key];
+        if (n.empty() || !n.isInt()) return def;
+        return static_cast<int>(n);
+    };
+
+    ENABLE_ZUPT              = readOrInt("enable_zupt",              1);
+    ZUPT_VEL_WEIGHT          = readOr   ("zupt_vel_weight",          100.0);
+    ZUPT_POS_WEIGHT          = readOr   ("zupt_pos_weight",          1000.0);
+    STATIC_ACC_THR           = readOr   ("static_acc_thr",           0.5);
+    STATIC_GYR_THR           = readOr   ("static_gyr_thr",           0.05);
+    STATIC_FLOW_THR          = readOr   ("static_flow_thr",          2.0);
+    STATIC_WINDOW_SEC        = readOr   ("static_window_sec",        0.5);
+    STATIC_HOLD_SEC          = readOr   ("static_hold_sec",          0.5);
+    STATIC_INIT_BIAS_PRIMING = readOrInt("static_init_bias_priming", 1);
+    SOFTEN_FAILURE_ON_HOVER  = readOrInt("soften_failure_on_hover",  1);
+    HOVER_MIN_PARALLAX_FACTOR = readOr  ("hover_min_parallax_factor", 0.5);
+
+    ROS_INFO("hover-aware: zupt=%d (v=%.1f p=%.1f) acc_thr=%.3f gyr_thr=%.3f flow_thr=%.2f hold=%.2fs",
+             ENABLE_ZUPT, ZUPT_VEL_WEIGHT, ZUPT_POS_WEIGHT,
+             STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR, STATIC_HOLD_SEC);
+
     fsSettings.release();
 }
