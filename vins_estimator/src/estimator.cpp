@@ -173,34 +173,40 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
-    // Hover-aware fork: cap all_image_frame during INITIAL state.
+    // Long-idle safety reset (hover-aware fork).
     //
-    // Upstream only trims this map under MARGIN_OLD. When the device is held
-    // still, every frame falls below the parallax threshold, so the flag is
-    // MARGIN_SECOND_NEW and the map grows by ~10 entries/sec indefinitely.
-    // Every initialStructure() attempt then iterates the entire map
-    // (observability check, static-bias priming's repropagate, gyroscope
-    // bias LS, VisualIMUAlignment) — at a few hundred entries the per-
-    // attempt cost exceeds the 100 ms retry period and the estimator thread
-    // falls behind the image stream, backlog accumulates in feature_buf,
-    // and once init finally succeeds the queue drains in fast-forward.
+    // Stock VINS-Mono only trims all_image_frame when slideWindow() fires
+    // with MARGIN_OLD. Under prolonged low-parallax conditions (hover, hand
+    // still, camera pointed at a static scene) the parallax check always
+    // returns MARGIN_SECOND_NEW and the map grows by ~10 entries/sec
+    // indefinitely. Every initialStructure() iterates the whole map, so at
+    // a few hundred entries the per-attempt cost exceeds the 100 ms retry
+    // period and the estimator thread falls behind the image stream —
+    // leading to either fast-forward replay after init or total inability
+    // to initialise after a long idle.
     //
-    // Capping to WINDOW_SIZE + 5 keeps the data structure bounded at its
-    // useful size (init only uses the last WINDOW_SIZE+1 frames anyway —
-    // everything older is irrelevant to the current sliding window).
-    if (solver_flag == INITIAL)
+    // The first fix I tried was a straight cap that trimmed oldest entries
+    // from all_image_frame directly. That broke initialisation entirely:
+    // Headers[0..WINDOW_SIZE] still references the original first-frame
+    // timestamp, so deleting it from the map leaves initialStructure's
+    // PnP / VisualIMUAlignment loops looking up a key that does not exist
+    // (std::map::operator[] silently inserts a default-constructed
+    // ImageFrame) and the alignment math corrupts.
+    //
+    // Safe equivalent: when the map grows unreasonably large during INITIAL
+    // (well past any sensible window), trigger a full estimator reset via
+    // clearState(). This drops any accumulated SfM work but re-synchronises
+    // Headers, pre_integrations and all_image_frame from scratch, and the
+    // next frame starts fresh. The threshold is generous (150 entries ≈
+    // 15 seconds of images) so a normal motion-based init that takes a
+    // few seconds is unaffected.
+    if (solver_flag == INITIAL && all_image_frame.size() > 150)
     {
-        const size_t cap = WINDOW_SIZE + 5;
-        while (all_image_frame.size() > cap)
-        {
-            auto it = all_image_frame.begin();
-            if (it->second.pre_integration)
-            {
-                delete it->second.pre_integration;
-                it->second.pre_integration = nullptr;
-            }
-            all_image_frame.erase(it);
-        }
+        ROS_WARN("all_image_frame grew to %zu during INITIAL — resetting estimator to keep init attempts O(1).",
+                 all_image_frame.size());
+        clearState();
+        setParameter();
+        return;
     }
 
     if(ESTIMATE_EXTRINSIC == 2)

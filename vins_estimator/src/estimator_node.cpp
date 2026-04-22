@@ -172,23 +172,14 @@ void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
     }
     m_buf.lock();
     feature_buf.push(feature_msg);
-
-    // Hover-aware fork: drop stale features during INITIAL state.
-    //
-    // When the user holds the drone still then later starts moving, every
-    // failed init attempt costs time and feature_buf fills up. Once init
-    // succeeds the backlog replays in fast-forward — the user sees poses
-    // jumping through history instead of tracking real-time motion.
-    //
-    // Cap at 3 pending features during INITIAL (enough to keep getMeasurements
-    // happy, small enough that any lag flushes within 300 ms). The newest
-    // features are what matter for init anyway; old ones taken while the
-    // drone was stationary in a different pose are useless.
-    if (estimator.solver_flag == Estimator::SolverFlag::INITIAL)
-    {
-        while (feature_buf.size() > 3)
-            feature_buf.pop();
-    }
+    // Previous fork versions capped feature_buf at 3 during INITIAL to avoid
+    // "fast-forward replay" after a long idle. That cap broke init: dropping
+    // feature frames at the producer starves the estimator's processImage()
+    // of the dense timestamp sequence it needs for SfM/IMU alignment, so
+    // initialStructure() fell into a loop of silent failures. The real fix
+    // for the fast-forward symptom is in estimator.cpp — resetting the
+    // estimator (clearState) when all_image_frame grows unbounded during
+    // INITIAL — so no cap is needed here.
     m_buf.unlock();
     con.notify_one();
 }
