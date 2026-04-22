@@ -573,6 +573,53 @@ bool Estimator::visualInitialAlign()
         return false;
     }
 
+    // IMU-vs-visual rotation consistency check (hover-aware fork).
+    //
+    // Catches the "upside-down map" / "rectangle rotated 180°" failure that
+    // occurs rarely on violent hand-lifts: the five-point relative pose
+    // solver has a known chirality/mirror ambiguity, and under a brief
+    // baseline with heavy rotational content it sometimes returns the
+    // twisted (~180°-flipped) solution. SfM built on top of that twist
+    // produces Rs[] whose cumulative rotation over the window disagrees
+    // sharply with the IMU's integrated rotation — but all the other
+    // existing sanity checks (|g|, scale>0, |V|) are happy, so init
+    // otherwise "succeeds" and the state immediately looks upside-down in
+    // rviz.
+    //
+    // After solveGyroscopeBias + repropagate (already done above via
+    // VisualIMUAlignment) the IMU delta_q's are bias-corrected. If SfM is
+    // honest, the accumulated IMU rotation from frame 0 to frame WINDOW_SIZE
+    // should match Rs[0]^{-1} * Rs[WINDOW_SIZE] within a few degrees (gyro
+    // noise over ~0.5 s of integration). If they disagree by more than
+    // ~25°, one of them is lying — and since we trust the IMU's gyro far
+    // more than a noisy 2-view geometry on a short baseline, we reject.
+    {
+        Eigen::Quaterniond q_imu = Eigen::Quaterniond::Identity();
+        for (int i = 1; i <= WINDOW_SIZE; i++)
+        {
+            if (pre_integrations[i])
+                q_imu = q_imu * pre_integrations[i]->delta_q;
+        }
+        Eigen::Quaterniond q_vis(Rs[0].transpose() * Rs[WINDOW_SIZE]);
+        q_imu.normalize();
+        q_vis.normalize();
+        double disagree_rad = q_imu.angularDistance(q_vis);
+        double disagree_deg = disagree_rad * 180.0 / M_PI;
+        // 25° is well above the ~1–3° gyro-integration error we'd expect
+        // from a ~0.5-s window at fork-tuned bias priming, and well below
+        // the ~180° signature of a twisted-SfM solve. Users report the
+        // flip as a full 180° rectangle flip; this threshold catches that
+        // with ~100 × margin to gyro noise.
+        if (disagree_deg > 25.0)
+        {
+            ROS_WARN("init rejected: IMU/visual rotation disagreement "
+                     "%.1f deg (SfM likely twisted/mirrored)", disagree_deg);
+            return false;
+        }
+        ROS_INFO("init rotation check OK (IMU/visual disagree %.2f deg)",
+                 disagree_deg);
+    }
+
     return true;
 }
 
