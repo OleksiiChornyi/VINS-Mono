@@ -173,6 +173,36 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
+    // Hover-aware fork: cap all_image_frame during INITIAL state.
+    //
+    // Upstream only trims this map under MARGIN_OLD. When the device is held
+    // still, every frame falls below the parallax threshold, so the flag is
+    // MARGIN_SECOND_NEW and the map grows by ~10 entries/sec indefinitely.
+    // Every initialStructure() attempt then iterates the entire map
+    // (observability check, static-bias priming's repropagate, gyroscope
+    // bias LS, VisualIMUAlignment) — at a few hundred entries the per-
+    // attempt cost exceeds the 100 ms retry period and the estimator thread
+    // falls behind the image stream, backlog accumulates in feature_buf,
+    // and once init finally succeeds the queue drains in fast-forward.
+    //
+    // Capping to WINDOW_SIZE + 5 keeps the data structure bounded at its
+    // useful size (init only uses the last WINDOW_SIZE+1 frames anyway —
+    // everything older is irrelevant to the current sliding window).
+    if (solver_flag == INITIAL)
+    {
+        const size_t cap = WINDOW_SIZE + 5;
+        while (all_image_frame.size() > cap)
+        {
+            auto it = all_image_frame.begin();
+            if (it->second.pre_integration)
+            {
+                delete it->second.pre_integration;
+                it->second.pre_integration = nullptr;
+            }
+            all_image_frame.erase(it);
+        }
+    }
+
     if(ESTIMATE_EXTRINSIC == 2)
     {
         ROS_INFO("calibrating extrinsic param, rotation movement is needed");
@@ -493,50 +523,35 @@ bool Estimator::visualInitialAlign()
 
     // Post-init gravity-direction sanity (hover-aware fix).
     //
-    // The visual-inertial alignment can converge to a gravity vector that is
-    // off-direction when the motion during init was weak (near-zero parallax,
-    // rank-deficient linear system), or when init completes during a sharp
-    // takeoff transient. When that happens, the estimator reports a finished
-    // init but the residual (g_true - g_est) integrates into position at
-    // ~0.5·|Δg|·t² — a few seconds later the pose "flies off" tens of metres.
+    // Only runs when the detector confirms the device is CURRENTLY stationary.
+    // An earlier version of this check used a cached meanAcc from a previous
+    // still moment as fallback, but that broke inits where the user rotated
+    // the device between pre-arm and takeoff: cached meanAcc is in the OLD
+    // body frame, recovered gravity is in the NEW body frame, the angle
+    // check produces spurious rejections, and init never completes.
     //
-    // Reference gravity direction: prefer the currently stationary meanAcc,
-    // otherwise fall back to the last-known stationary reference (cached in
-    // the detector from a prior still moment — typically pre-arm on the
-    // ground). The fallback is what makes this check effective during
-    // takeoff inits, where the detector is no longer stationary right at
-    // the moment visualInitialAlign finishes.
-    if (STATIC_INIT_BIAS_PRIMING)
+    // For the takeoff case (not stationary at init time) we rely on:
+    //   1. VisualIMUAlignment's built-in |g.norm()-G.norm()| < 1.0 check
+    //   2. INIT_MAX_VELOCITY rejection below
+    //   3. The runaway guard in failureDetection() catching any bad init
+    //      within 0.5 s (well before the pose can drift far)
+    if (STATIC_INIT_BIAS_PRIMING &&
+        motion_detector.isStationary() && motion_detector.imuCount() >= 20)
     {
-        Vector3d g_body_expected = Vector3d::Zero();
-        const char *src = nullptr;
-        if (motion_detector.isStationary() && motion_detector.imuCount() >= 20)
+        Vector3d g_body_expected = motion_detector.meanAcc();
+        Vector3d g_body_recovered = Rs[0].transpose() * g;
+        if (g_body_expected.norm() > 1e-3 && g_body_recovered.norm() > 1e-3)
         {
-            g_body_expected = motion_detector.meanAcc();
-            src = "live";
-        }
-        else if (motion_detector.hasStationaryReference())
-        {
-            g_body_expected = motion_detector.stationaryReferenceAcc();
-            src = "cached";
-        }
-
-        if (src && g_body_expected.norm() > 1e-3)
-        {
-            Vector3d g_body_recovered = Rs[0].transpose() * g;
-            if (g_body_recovered.norm() > 1e-3)
+            double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
+            if (cos_a > 1.0)  cos_a = 1.0;
+            if (cos_a < -1.0) cos_a = -1.0;
+            double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
+            if (angle_deg > GRAVITY_CHECK_ANGLE_DEG)
             {
-                double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
-                if (cos_a > 1.0)  cos_a = 1.0;
-                if (cos_a < -1.0) cos_a = -1.0;
-                double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
-                if (angle_deg > GRAVITY_CHECK_ANGLE_DEG)
-                {
-                    ROS_WARN("init rejected: gravity mismatch %.1f deg (ref=%s)", angle_deg, src);
-                    return false;
-                }
-                ROS_INFO("init gravity check OK %.1f deg (ref=%s)", angle_deg, src);
+                ROS_WARN("init rejected: live gravity mismatch %.1f deg", angle_deg);
+                return false;
             }
+            ROS_INFO("init gravity check OK (%.1f deg)", angle_deg);
         }
     }
 

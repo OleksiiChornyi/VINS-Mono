@@ -172,6 +172,23 @@ void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
     }
     m_buf.lock();
     feature_buf.push(feature_msg);
+
+    // Hover-aware fork: drop stale features during INITIAL state.
+    //
+    // When the user holds the drone still then later starts moving, every
+    // failed init attempt costs time and feature_buf fills up. Once init
+    // succeeds the backlog replays in fast-forward — the user sees poses
+    // jumping through history instead of tracking real-time motion.
+    //
+    // Cap at 3 pending features during INITIAL (enough to keep getMeasurements
+    // happy, small enough that any lag flushes within 300 ms). The newest
+    // features are what matter for init anyway; old ones taken while the
+    // drone was stationary in a different pose are useless.
+    if (estimator.solver_flag == Estimator::SolverFlag::INITIAL)
+    {
+        while (feature_buf.size() > 3)
+            feature_buf.pop();
+    }
     m_buf.unlock();
     con.notify_one();
 }
