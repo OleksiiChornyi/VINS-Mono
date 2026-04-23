@@ -235,11 +235,20 @@ void process()
                 double t = imu_msg->header.stamp.toSec();
                 double img_t = img_msg->header.stamp.toSec() + estimator.td;
                 if (t <= img_t)
-                { 
+                {
                     if (current_time < 0)
                         current_time = t;
                     double dt = t - current_time;
-                    ROS_ASSERT(dt >= 0);
+                    // Auto-reset path in estimator.cpp (all_image_frame > 150) clears
+                    // td back to TD without resetting current_time here; subsequent
+                    // online-td updates can make t < current_time. Resync instead
+                    // of asserting so the estimator keeps producing odometry.
+                    if (dt < 0)
+                    {
+                        ROS_WARN("imu dt < 0 (%.6fs); resyncing current_time after estimator reset", dt);
+                        current_time = t;
+                        dt = 0;
+                    }
                     current_time = t;
                     dx = imu_msg->linear_acceleration.x;
                     dy = imu_msg->linear_acceleration.y;
@@ -255,8 +264,15 @@ void process()
                 {
                     double dt_1 = img_t - current_time;
                     double dt_2 = t - img_t;
+                    // Same rationale as above: after auto-reset td jumps, img_t
+                    // can land before current_time. Clamp and keep going.
+                    if (dt_1 < 0)
+                    {
+                        ROS_WARN("img dt_1 < 0 (%.6fs); resyncing current_time after estimator reset", dt_1);
+                        current_time = img_t;
+                        dt_1 = 0;
+                    }
                     current_time = img_t;
-                    ROS_ASSERT(dt_1 >= 0);
                     ROS_ASSERT(dt_2 >= 0);
                     ROS_ASSERT(dt_1 + dt_2 > 0);
                     double w1 = dt_2 / (dt_1 + dt_2);
