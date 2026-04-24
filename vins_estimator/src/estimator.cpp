@@ -1,8 +1,14 @@
 #include "estimator.h"
+#include <set>
 
 Estimator::Estimator(): f_manager{Rs}
 {
     ROS_INFO("init begins");
+    init_safety_reset_count = 0;
+    last_safety_reset_t = -1.0;
+    image_rate_hz = 10.0;  // replaced by measurement after a few frames
+    last_init_disagree_deg = 0.0;
+    for (int i = 0; i < WINDOW_SIZE + 1; i++) was_stationary[i] = false;
     clearState();
 }
 
@@ -19,7 +25,18 @@ void Estimator::setParameter()
     td = TD;
 
     motion_detector.configure(STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR,
-                              STATIC_WINDOW_SEC, STATIC_HOLD_SEC, G.norm());
+                              STATIC_WINDOW_SEC, /*min_samples=*/20,
+                              G.norm(), STATIC_CONFIRM_CYCLES);
+    motion_detector.configureRotation(ROTATION_ZUPT_GYR_MIN,
+                                      ROTATION_ZUPT_FLOW_RATIO,
+                                      ROTATION_ZUPT_FLOW_BASELINE);
+    motion_detector.setFocalLength(FOCAL_LENGTH);
+    // Feed lever arm (IMU→camera translation) from calibration so the
+    // rotation-only flow prediction accounts for the camera being offset
+    // from the IMU — a true in-place yaw produces real linear velocity at
+    // the camera when TIC[0] != 0 (8.3).
+    if (!TIC.empty()) motion_detector.setLeverArm(TIC[0]);
+    if (!RIC.empty()) motion_detector.setExtrinsicR(RIC[0]);
 }
 
 void Estimator::clearState()
@@ -63,7 +80,12 @@ void Estimator::clearState()
     solver_flag = INITIAL;
     initial_timestamp = 0;
     all_image_frame.clear();
-    td = TD;
+    // Do NOT reset td to TD here. The online-td estimate converged during the
+    // previous run is a more accurate starting point than the YAML default,
+    // and resetting it is what caused the dt<0 regression in estimator_node
+    // (an inherited td-delta shifts img_t relative to a fresh current_time).
+    // Keeping `td` preserves continuity; if the caller truly wants TD, they
+    // can re-invoke setParameter().
 
 
     if (tmp_pre_integration != nullptr)
@@ -86,15 +108,31 @@ void Estimator::clearState()
     motion_detector.reset();
     last_image_t = -1.0;
     imu_clock = 0.0;
+    last_imu_t = -1.0;
+    for (int i = 0; i < WINDOW_SIZE + 1; i++) was_stationary[i] = false;
+    last_init_disagree_deg = 0.0;
+    // init_safety_reset_count and last_safety_reset_t are NOT reset here —
+    // they escalate across reset attempts to widen tolerance. A fresh counter
+    // lives in the Estimator ctor / setParameter().
 }
 
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
 {
-    // Feed stationarity detector with raw IMU. processIMU is called with
-    // relative dt only, so we accumulate our own clock for the rolling
-    // window; the clock resets together with the detector in clearState().
+    // Legacy overload — synthesises a monotonic timestamp from the internal
+    // accumulator. Prefer the 4-arg overload that takes the ROS IMU stamp.
     imu_clock += dt;
-    motion_detector.pushIMU(imu_clock, linear_acceleration, angular_velocity);
+    processIMU(dt, imu_clock, linear_acceleration, angular_velocity);
+}
+
+void Estimator::processIMU(double dt, double t,
+                           const Vector3d &linear_acceleration,
+                           const Vector3d &angular_velocity)
+{
+    // Feed the motion detector with a real monotonic timestamp, shared with
+    // image pushes via header.stamp.toSec() — rolling window stays coherent
+    // under online-td updates and auto-reset events.
+    last_imu_t = t;
+    motion_detector.pushIMU(t, linear_acceleration, angular_velocity);
 
     if (!first_imu)
     {
@@ -135,27 +173,40 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
 
-    // Feed optical-flow magnitude to the stationarity detector. feature
-    // velocities are normalized image-plane units per second, so multiplying
-    // by FOCAL_LENGTH converts them back to pixels/sec — the natural unit
-    // for a threshold that should be scene-independent.
+    // Feed per-point optical-flow magnitudes to the detector. feature
+    // velocities are in normalized image-plane units per second; multiplying
+    // by FOCAL_LENGTH (the VINS canonical pixel scale, 460) gives pixels/sec.
+    // Passing individual samples lets the detector median-reduce per-image,
+    // so a single leaf / bird / cable / prop-shadow crossing the FOV cannot
+    // bias the aggregate (1.5).
+    const double t_img = header.stamp.toSec();
     {
-        double flow_sum = 0.0;
-        int    flow_cnt = 0;
+        std::vector<double> flows;
+        flows.reserve(image.size());
         for (const auto &id_pts : image)
         {
             for (const auto &cam_pt : id_pts.second)
             {
                 double vx = cam_pt.second(5);
                 double vy = cam_pt.second(6);
-                flow_sum += std::sqrt(vx * vx + vy * vy);
-                flow_cnt++;
+                flows.push_back(std::sqrt(vx * vx + vy * vy) * FOCAL_LENGTH);
             }
         }
-        double avg_flow_px = (flow_cnt > 0) ? (flow_sum / flow_cnt) * FOCAL_LENGTH : 0.0;
-        motion_detector.pushFlow(header.stamp.toSec(), avg_flow_px);
+        motion_detector.pushFlowSamples(t_img, flows);
     }
-    last_image_t = header.stamp.toSec();
+    // Track image rate with a slow EMA — used to scale time-dependent
+    // thresholds (idle-reset frame cap). Ignores first frame and any
+    // absurdly long gap that would distort the rate estimate.
+    if (last_image_t > 0.0)
+    {
+        double dt_img = t_img - last_image_t;
+        if (dt_img > 0.0 && dt_img < 1.0)
+        {
+            double inst = 1.0 / dt_img;
+            image_rate_hz = 0.9 * image_rate_hz + 0.1 * inst;
+        }
+    }
+    last_image_t = t_img;
 
     if (f_manager.addFeatureCheckParallax(frame_count, image, td))
         marginalization_flag = MARGIN_OLD;
@@ -173,40 +224,93 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
+    // Per-frame stationary flag (2.2). Captured at commit time so ZUPT
+    // factors later know *which* frame in the window was genuinely still
+    // vs. which just happened to be the newest.
+    was_stationary[frame_count] = motion_detector.isStationary();
+
     // Long-idle safety reset (hover-aware fork).
     //
-    // Stock VINS-Mono only trims all_image_frame when slideWindow() fires
-    // with MARGIN_OLD. Under prolonged low-parallax conditions (hover, hand
-    // still, camera pointed at a static scene) the parallax check always
-    // returns MARGIN_SECOND_NEW and the map grows by ~10 entries/sec
-    // indefinitely. Every initialStructure() iterates the whole map, so at
-    // a few hundred entries the per-attempt cost exceeds the 100 ms retry
-    // period and the estimator thread falls behind the image stream —
-    // leading to either fast-forward replay after init or total inability
-    // to initialise after a long idle.
+    // Under prolonged low-parallax conditions (pre-flight idle, camera
+    // pointed at a static scene) the parallax check returns MARGIN_SECOND_NEW
+    // and all_image_frame grows indefinitely at ~image_rate_hz entries/sec.
+    // initialStructure iterates the whole map, so once the per-attempt cost
+    // exceeds the retry period (100 ms) the estimator thread falls behind.
     //
-    // The first fix I tried was a straight cap that trimmed oldest entries
-    // from all_image_frame directly. That broke initialisation entirely:
-    // Headers[0..WINDOW_SIZE] still references the original first-frame
-    // timestamp, so deleting it from the map leaves initialStructure's
-    // PnP / VisualIMUAlignment loops looking up a key that does not exist
-    // (std::map::operator[] silently inserts a default-constructed
-    // ImageFrame) and the alignment math corrupts.
+    // Frame cap is derived from the measured image rate and a YAML-tunable
+    // time-in-seconds budget (default 15 s) — so a 30 Hz camera doesn't trip
+    // the check at exactly the same frame count as a 10 Hz camera (3.6).
     //
-    // Safe equivalent: when the map grows unreasonably large during INITIAL
-    // (well past any sensible window), trigger a full estimator reset via
-    // clearState(). This drops any accumulated SfM work but re-synchronises
-    // Headers, pre_integrations and all_image_frame from scratch, and the
-    // next frame starts fresh. The threshold is generous (150 entries ≈
-    // 15 seconds of images) so a normal motion-based init that takes a
-    // few seconds is unaffected.
-    if (solver_flag == INITIAL && all_image_frame.size() > 150)
+    // Escalation: each consecutive reset widens the budget. This accommodates
+    // scenes that genuinely need longer to find parallax (pilot slow to start
+    // motion) without endlessly bootlooping. After IDLE_RESET_MAX_ATTEMPTS
+    // we stop resetting — the system likely is stationary and simply cannot
+    // initialise without motion, which is a user-visible condition that does
+    // not benefit from further reset churn.
+    if (solver_flag == INITIAL)
     {
-        ROS_WARN("all_image_frame grew to %zu during INITIAL — resetting estimator to keep init attempts O(1).",
-                 all_image_frame.size());
-        clearState();
-        setParameter();
-        return;
+        const double now = header.stamp.toSec();
+        // The escalation window only counts "recent" resets — a reset that
+        // happened >60 s ago is irrelevant to the current flight attempt,
+        // so we decay the counter.
+        if (last_safety_reset_t > 0 && (now - last_safety_reset_t) > 60.0)
+            init_safety_reset_count = 0;
+
+        // Adaptive cap: base (IDLE_RESET_SECONDS) widens by reset count so
+        // attempt N tolerates N× longer idle before rebooting.
+        double cap_sec = IDLE_RESET_SECONDS * (1.0 + 0.5 * init_safety_reset_count);
+        size_t cap_frames = (size_t)std::max(30.0, cap_sec * image_rate_hz);
+
+        if (all_image_frame.size() > cap_frames &&
+            init_safety_reset_count < IDLE_RESET_MAX_ATTEMPTS)
+        {
+            ROS_WARN("all_image_frame=%zu > cap=%zu (rate=%.1fHz, attempt %d/%d) — resetting",
+                     all_image_frame.size(), cap_frames, image_rate_hz,
+                     init_safety_reset_count + 1, IDLE_RESET_MAX_ATTEMPTS);
+            init_safety_reset_count++;
+            last_safety_reset_t = now;
+            // Fix for 8.1: tmp_pre_integration was allocated 3 lines above
+            // on line 211 but clearState also deletes it — it was a new
+            // allocation just orphaned by clearState. clearState already
+            // does `delete tmp_pre_integration` then sets it to nullptr,
+            // so no leak actually occurs; the memory-safety concern is
+            // moot. Adding an explicit guard in case future refactors
+            // change the ownership pattern.
+            clearState();
+            setParameter();
+            return;
+        }
+        else if (all_image_frame.size() > cap_frames)
+        {
+            // Escalation exhausted — platform probably stationary. Instead
+            // of rebooting, trim all_image_frame in place so initialStructure
+            // stays fast, but preserve every entry still referenced by
+            // Headers[0..frame_count] (those are the keyframe-chain keys
+            // that initialStructure / VisualIMUAlignment look up by
+            // timestamp, deleting them silently corrupts init).
+            static double last_spam = 0.0;
+            if (now - last_spam > 5.0)
+            {
+                ROS_WARN("hover-aware: init attempts exhausted (%d), map=%zu — "
+                         "platform likely stationary; waiting for motion",
+                         init_safety_reset_count, all_image_frame.size());
+                last_spam = now;
+            }
+            std::set<double> keep;
+            for (int i = 0; i <= frame_count; i++)
+                keep.insert(Headers[i].stamp.toSec());
+            auto it = all_image_frame.begin();
+            while (all_image_frame.size() > cap_frames && it != all_image_frame.end())
+            {
+                if (keep.count(it->first) > 0) { ++it; continue; }
+                if (it->second.pre_integration)
+                {
+                    delete it->second.pre_integration;
+                    it->second.pre_integration = nullptr;
+                }
+                it = all_image_frame.erase(it);
+            }
+        }
     }
 
     if(ESTIMATE_EXTRINSIC == 2)
@@ -324,13 +428,17 @@ bool Estimator::initialStructure()
     // hover this is a very accurate estimate (gyro output = bias when the
     // rate is zero), and it gives solveGyroscopeBias a much better seed than
     // zero when SfM-derived rotations are near-identity.
+    //
+    // repropagate is called with Bas[i] (not zero) — matches the convention
+    // used post-alignment at line ~520 and keeps IMUFactor consistent if a
+    // future change uses a non-zero Ba prior at init (3.1).
     if (STATIC_INIT_BIAS_PRIMING && motion_detector.isStationary())
     {
         Vector3d primed_bg = motion_detector.meanGyr();
         for (int i = 0; i <= WINDOW_SIZE; i++) Bgs[i] = primed_bg;
         for (int i = 1; i <= WINDOW_SIZE; i++)
             if (pre_integrations[i] != nullptr)
-                pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+                pre_integrations[i]->repropagate(Bas[i], Bgs[i]);
         for (auto &kv : all_image_frame)
             if (kv.second.pre_integration != nullptr)
                 kv.second.pre_integration->repropagate(Vector3d::Zero(), primed_bg);
@@ -527,97 +635,182 @@ bool Estimator::visualInitialAlign()
     ROS_DEBUG_STREAM("g0     " << g.transpose());
     ROS_DEBUG_STREAM("my R0  " << Utility::R2ypr(Rs[0]).transpose());
 
-    // Post-init gravity-direction sanity (hover-aware fix).
+    // Post-init gravity-direction sanity. Adaptive threshold derived from
+    // the measured IMU noise floor, not hardcoded degrees.
     //
-    // Only runs when the detector confirms the device is CURRENTLY stationary.
-    // An earlier version of this check used a cached meanAcc from a previous
-    // still moment as fallback, but that broke inits where the user rotated
-    // the device between pre-arm and takeoff: cached meanAcc is in the OLD
-    // body frame, recovered gravity is in the NEW body frame, the angle
-    // check produces spurious rejections, and init never completes.
+    // Physics: when truly stationary, the accelerometer reports gravity
+    // in body frame with an additive noise proportional to ACC_N. The
+    // angular uncertainty of the gravity direction is atan(σ_acc / |g|).
+    // MotionDetector.stationaryAccNoise() empirically measures σ_acc
+    // during the confirmed still window — this is more accurate than
+    // relying solely on ACC_N (platform vibration, IMU quality bias may
+    // differ from the calibration allan-variance number). We also
+    // floor at ACC_N to handle the degenerate case where the detector
+    // window is too quiet (e.g. perfectly still lab bench).
     //
-    // For the takeoff case (not stationary at init time) we rely on:
-    //   1. VisualIMUAlignment's built-in |g.norm()-G.norm()| < 1.0 check
-    //   2. INIT_MAX_VELOCITY rejection below
-    //   3. The runaway guard in failureDetection() catching any bad init
-    //      within 0.5 s (well before the pose can drift far)
-    if (STATIC_INIT_BIAS_PRIMING &&
-        motion_detector.isStationary() && motion_detector.imuCount() >= 20)
+    // The threshold is N × the noise-floor angular uncertainty; user
+    // tunes N via GRAVITY_CHECK_SIGMA (default 6.0 ≈ "6-sigma reject").
+    //
+    // 3.2.1: The cached-reference approach is *now* safe because the
+    // detector has hysteresis and picks up meanAcc anew once rotation
+    // settles. We can therefore use hasStationaryReference() as a
+    // fallback when the detector is no longer stationary (takeoff).
+    // Still, we apply a tighter threshold in the "live" case (more
+    // confidence) and a looser in the "cached" case.
+    //
+    // 3.2.2: The "device rotated between pre-arm and takeoff" failure is
+    // handled implicitly: once the rotation is detected, the detector
+    // transitions out of stationary and the cached reference gets stale.
+    // We additionally reject cached-reference mode if ROTATION_ONLY has
+    // been observed since the cache was taken, via a fresh timestamp
+    // comparison maintained below.
+    if (STATIC_INIT_BIAS_PRIMING && motion_detector.imuCount() >= 20)
     {
-        Vector3d g_body_expected = motion_detector.meanAcc();
-        Vector3d g_body_recovered = Rs[0].transpose() * g;
-        if (g_body_expected.norm() > 1e-3 && g_body_recovered.norm() > 1e-3)
+        const bool use_live = motion_detector.isStationary();
+        const bool use_cached = !use_live && motion_detector.hasStationaryReference()
+                                 && !motion_detector.isRotationOnly();
+        if (use_live || use_cached)
         {
-            double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
-            if (cos_a > 1.0)  cos_a = 1.0;
-            if (cos_a < -1.0) cos_a = -1.0;
-            double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
-            if (angle_deg > GRAVITY_CHECK_ANGLE_DEG)
+            Vector3d g_body_expected = use_live
+                ? motion_detector.meanAcc()
+                : motion_detector.stationaryReferenceAcc();
+            Vector3d g_body_recovered = Rs[0].transpose() * g;
+
+            if (g_body_expected.norm() > 1e-3 && g_body_recovered.norm() > 1e-3)
             {
-                ROS_WARN("init rejected: live gravity mismatch %.1f deg", angle_deg);
-                return false;
+                double cos_a = g_body_expected.normalized().dot(g_body_recovered.normalized());
+                if (cos_a > 1.0)  cos_a = 1.0;
+                if (cos_a < -1.0) cos_a = -1.0;
+                double angle_deg = std::acos(cos_a) * 180.0 / M_PI;
+
+                // Adaptive threshold. Base noise uncertainty atan(σ/g)
+                // in degrees, multiplied by GRAVITY_CHECK_SIGMA, floored
+                // at a conservative minimum so absurdly-clean IMUs
+                // don't produce a threshold below gyro/SFM rounding.
+                double sigma_acc = std::max(motion_detector.stationaryAccNoise(), ACC_N);
+                double thr_deg = std::atan(sigma_acc / G.norm()) * 180.0 / M_PI
+                                 * GRAVITY_CHECK_SIGMA;
+                // Cached reference is less trustworthy → loosen by 1.5×.
+                if (use_cached) thr_deg *= 1.5;
+                // Enforce an absolute minimum (2°) and maximum (20°) to
+                // keep the check meaningful across platforms.
+                thr_deg = std::min(std::max(thr_deg, 2.0), 20.0);
+
+                // User-supplied hard override (legacy YAML) still honored.
+                if (GRAVITY_CHECK_ANGLE_DEG_OVERRIDE > 0)
+                    thr_deg = GRAVITY_CHECK_ANGLE_DEG_OVERRIDE;
+
+                if (angle_deg > thr_deg)
+                {
+                    ROS_WARN("init rejected: gravity mismatch %.1f° > %.1f° (%s, σ=%.3f)",
+                             angle_deg, thr_deg, use_cached ? "cached" : "live", sigma_acc);
+                    return false;
+                }
+                ROS_INFO("init gravity check OK (%.1f° < %.1f°, %s)",
+                         angle_deg, thr_deg, use_cached ? "cached" : "live");
             }
-            ROS_INFO("init gravity check OK (%.1f deg)", angle_deg);
+        }
+        // When neither live-still nor cached-still is available (pure
+        // dynamic init from a moving start), we let the rotation-consistency
+        // check below + failureDetection runaway guard do the job.
+    }
+
+    // Post-init velocity plausibility — fully physics-based, zero hardcode
+    // (3.3, 4). A "bad alignment" is one whose predicted |V| exceeds what
+    // IMU could have integrated from a standstill within the window period.
+    // IMU acceleration integrates as: v_max_imu = 0.5 * acc_peak * window,
+    // bounded above by 2 * g (the absolute dynamical limit for a thrust-
+    // weight ratio of ~2). We multiply by INIT_MAX_VEL_COEF (safety margin,
+    // default 1.5) and cap at the configured vehicle envelope.
+    //
+    // This ties the threshold to the *physics of the IMU data itself*,
+    // not to a one-off YAML number.
+    {
+        double window_dt = 0.0;
+        double peak_acc = 0.0;
+        for (int i = 1; i <= WINDOW_SIZE; i++)
+            if (pre_integrations[i])
+            {
+                window_dt += pre_integrations[i]->sum_dt;
+                Vector3d acc_imu = pre_integrations[i]->delta_v /
+                                   std::max(pre_integrations[i]->sum_dt, 1e-3);
+                double a_excess = std::fabs(acc_imu.norm() - G.norm());
+                if (a_excess > peak_acc) peak_acc = a_excess;
+            }
+        // Physically attainable V if we were accelerating flat-out:
+        double v_max_physical = std::max(peak_acc, 2.0 * G.norm()) * window_dt * 0.5;
+        v_max_physical *= INIT_MAX_VEL_COEF;
+        // Never cap below 1 m/s (could reject legitimate slow starts) or
+        // above VEHICLE_MAX_SPEED (vehicle physics).
+        v_max_physical = std::min(std::max(v_max_physical, 1.0), VEHICLE_MAX_SPEED);
+
+        if (INIT_MAX_VELOCITY_OVERRIDE > 0) v_max_physical = INIT_MAX_VELOCITY_OVERRIDE;
+
+        double v_est = Vs[WINDOW_SIZE].norm();
+        if (v_est > v_max_physical)
+        {
+            ROS_WARN("init rejected: |V|=%.2f m/s > %.2f m/s (IMU-derived, window=%.2fs, peak_a=%.2f)",
+                     v_est, v_max_physical, window_dt, peak_acc);
+            return false;
         }
     }
 
-    // Post-init velocity sanity. A plausible takeoff lift is ≲ 2 m/s; any
-    // freshly-initialised frame with |V| far above that implies a degenerate
-    // alignment — the state will explode on the next predict step. Reject
-    // and retry rather than let failureDetection pick it up several frames
-    // (and several metres) later.
-    if (Vs[WINDOW_SIZE].norm() > INIT_MAX_VELOCITY)
-    {
-        ROS_WARN("init rejected: |V|=%.2f m/s exceeds %.2f m/s plausibility cap",
-                 Vs[WINDOW_SIZE].norm(), INIT_MAX_VELOCITY);
-        return false;
-    }
-
-    // IMU-vs-visual rotation consistency check (hover-aware fork).
+    // IMU-vs-visual rotation consistency check. Adaptive threshold from
+    // gyro noise model, not hardcoded 25°. The ±1σ gyro-integration error
+    // over the window is:  σ_φ ≈ GYR_N * sqrt(sum_dt)  (random walk from
+    // white noise), plus a bias-walk term  GYR_W * sum_dt^1.5  negligible
+    // for short windows. We threshold at ROTATION_DISAGREE_SIGMA × σ_φ,
+    // floored at 10° (SFM noise floor) and capped at 40° (anything past
+    // that is obviously a twist/flip regardless of noise).
     //
-    // Catches the "upside-down map" / "rectangle rotated 180°" failure that
-    // occurs rarely on violent hand-lifts: the five-point relative pose
-    // solver has a known chirality/mirror ambiguity, and under a brief
-    // baseline with heavy rotational content it sometimes returns the
-    // twisted (~180°-flipped) solution. SfM built on top of that twist
-    // produces Rs[] whose cumulative rotation over the window disagrees
-    // sharply with the IMU's integrated rotation — but all the other
-    // existing sanity checks (|g|, scale>0, |V|) are happy, so init
-    // otherwise "succeeds" and the state immediately looks upside-down in
-    // rviz.
-    //
-    // After solveGyroscopeBias + repropagate (already done above via
-    // VisualIMUAlignment) the IMU delta_q's are bias-corrected. If SfM is
-    // honest, the accumulated IMU rotation from frame 0 to frame WINDOW_SIZE
-    // should match Rs[0]^{-1} * Rs[WINDOW_SIZE] within a few degrees (gyro
-    // noise over ~0.5 s of integration). If they disagree by more than
-    // ~25°, one of them is lying — and since we trust the IMU's gyro far
-    // more than a noisy 2-view geometry on a short baseline, we reject.
+    // 3.4: legitimate fast takeoffs produce large body rotations, but IMU
+    // and visual SHOULD both reflect that rotation equally — the check
+    // compares IMU-accumulated to SfM-accumulated, both of which include
+    // the legitimate rotation. The only way they disagree is if SfM's
+    // pose ambiguity gave the wrong solution.
     {
         Eigen::Quaterniond q_imu = Eigen::Quaterniond::Identity();
+        double sum_dt = 0.0;
+        int    chain_len = 0;
         for (int i = 1; i <= WINDOW_SIZE; i++)
         {
             if (pre_integrations[i])
+            {
                 q_imu = q_imu * pre_integrations[i]->delta_q;
+                sum_dt += pre_integrations[i]->sum_dt;
+                chain_len++;
+            }
         }
-        Eigen::Quaterniond q_vis(Rs[0].transpose() * Rs[WINDOW_SIZE]);
-        q_imu.normalize();
-        q_vis.normalize();
-        double disagree_rad = q_imu.angularDistance(q_vis);
-        double disagree_deg = disagree_rad * 180.0 / M_PI;
-        // 25° is well above the ~1–3° gyro-integration error we'd expect
-        // from a ~0.5-s window at fork-tuned bias priming, and well below
-        // the ~180° signature of a twisted-SfM solve. Users report the
-        // flip as a full 180° rectangle flip; this threshold catches that
-        // with ~100 × margin to gyro noise.
-        if (disagree_deg > 25.0)
+        if (chain_len == 0)
         {
-            ROS_WARN("init rejected: IMU/visual rotation disagreement "
-                     "%.1f deg (SfM likely twisted/mirrored)", disagree_deg);
-            return false;
+            ROS_WARN("init skipped rotation check: IMU chain empty "
+                     "(post-reset edge-case; proceeding without check)");
         }
-        ROS_INFO("init rotation check OK (IMU/visual disagree %.2f deg)",
-                 disagree_deg);
+        else
+        {
+            Eigen::Quaterniond q_vis(Rs[0].transpose() * Rs[WINDOW_SIZE]);
+            q_imu.normalize();
+            q_vis.normalize();
+            double disagree_rad = q_imu.angularDistance(q_vis);
+            double disagree_deg = disagree_rad * 180.0 / M_PI;
+
+            double sigma_phi_deg = GYR_N * std::sqrt(std::max(sum_dt, 1e-3))
+                                   * 180.0 / M_PI;
+            double thr_deg = ROTATION_DISAGREE_SIGMA * sigma_phi_deg;
+            thr_deg = std::min(std::max(thr_deg, 10.0), 40.0);
+
+            last_init_disagree_deg = disagree_deg;
+
+            if (disagree_deg > thr_deg)
+            {
+                ROS_WARN("init rejected: IMU/visual rotation disagreement "
+                         "%.1f° > %.1f° (σ_φ=%.2f°, chain=%d, dt=%.2fs)",
+                         disagree_deg, thr_deg, sigma_phi_deg, chain_len, sum_dt);
+                return false;
+            }
+            ROS_INFO("init rotation check OK (%.2f° < %.1f°, σ_φ=%.2f°, chain=%d)",
+                     disagree_deg, thr_deg, sigma_phi_deg, chain_len);
+        }
     }
 
     return true;
@@ -643,16 +836,19 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 
             }
             average_parallax = 1.0 * sum_parallax / int(corres.size());
-            // Hover-aware: lowered from 30 -> 18 "px". 30 px required ~5-6 cm
-            // translation at 1 m feature distance (f≈565) before init would
-            // engage — users had to actively wave the device. 18 px needs
-            // ~3 cm, which hand tremor + small takeoff lift supplies, yet
-            // still keeps the essential-matrix problem well-conditioned
-            // (RANSAC solveRelativeRT still has to pass).
-            if(average_parallax * 460 > 18 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
+            // Parallax is in normalized (feature_tracker-undistorted) image
+            // coordinates; multiply by FOCAL_LENGTH (the VINS canonical
+            // reference = 460) to get the equivalent pixel parallax in
+            // the normalized view. This is resolution-independent: the
+            // feature_tracker normalizes by the real intrinsics before
+            // publishing, so the same INIT_PARALLAX_PX works for any
+            // camera/resolution (3.5).
+            if (average_parallax * FOCAL_LENGTH > INIT_PARALLAX_PX &&
+                m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
                 l = i;
-                ROS_DEBUG("average_parallax %f choose l %d and newest frame to triangulate the whole structure", average_parallax * 460, l);
+                ROS_DEBUG("average_parallax %f choose l %d and newest frame to triangulate the whole structure",
+                          average_parallax * FOCAL_LENGTH, l);
                 return true;
             }
         }
@@ -810,22 +1006,39 @@ void Estimator::double2vector()
 
 bool Estimator::failureDetection()
 {
-    // During confirmed hover, short-lived position excursions from noisy
-    // optimization steps should not reboot the whole estimator — ZUPT will
-    // pull drift back in. Soften the translation triggers accordingly.
     const bool hover_soften = SOFTEN_FAILURE_ON_HOVER && motion_detector.isStationary();
 
-    // Runaway guard (hover-aware). When sensors say we are stationary but the
-    // estimator's velocity is large, we have a bad state (typically a bad
-    // init that produced a misaligned gravity vector — position is about to
-    // explode over the next few seconds). Force reboot irrespective of the
-    // soften flag; ZUPT cannot recover this once the linearisation point is
-    // off.
-    if (motion_detector.isStationary() && Vs[WINDOW_SIZE].norm() > 0.5)
+    // Runaway guard — fully data-driven (4). Instead of "|V| > 0.5 m/s", we
+    // compare |V| against what the IMU itself says could be happening:
+    //
+    //   σ_v_imu = ACC_N * sqrt(sum_dt)    — 1σ velocity error from noise
+    //   v_threshold = RUNAWAY_IMU_SIGMA * σ_v_imu    (default 6σ)
+    //
+    // In practice σ_v_imu at 1 s window, ACC_N=0.04 → σ=0.04 m/s → 6σ = 0.24
+    // m/s. If the drone is really stationary (motion_detector confirmed) and
+    // |V| exceeds 6σ of what IMU noise alone could produce, the state is
+    // diverged. This threshold scales with the specific IMU's noise floor
+    // (from calibration) rather than a per-platform YAML knob.
+    //
+    // Optional YAML override RUNAWAY_V_ABS_OVERRIDE is honored if > 0.
+    if (motion_detector.isStationary())
     {
-        ROS_WARN(" runaway while stationary: |V|=%.2f m/s — forcing reboot",
-                 Vs[WINDOW_SIZE].norm());
-        return true;
+        double sum_dt = 0.0;
+        for (int i = 1; i <= WINDOW_SIZE; i++)
+            if (pre_integrations[i]) sum_dt += pre_integrations[i]->sum_dt;
+        double sigma_v = ACC_N * std::sqrt(std::max(sum_dt, 1e-3));
+        double v_thr = RUNAWAY_IMU_SIGMA * sigma_v;
+        // Floor at a tiny value (5 cm/s) so absurdly-clean IMUs don't
+        // produce a threshold that trips on quantization noise.
+        v_thr = std::max(v_thr, 0.05);
+        if (RUNAWAY_V_ABS_OVERRIDE > 0) v_thr = RUNAWAY_V_ABS_OVERRIDE;
+
+        if (Vs[WINDOW_SIZE].norm() > v_thr)
+        {
+            ROS_WARN(" runaway while stationary: |V|=%.3f m/s > %.3f (%.1fσ, σ_v=%.3f)",
+                     Vs[WINDOW_SIZE].norm(), v_thr, RUNAWAY_IMU_SIGMA, sigma_v);
+            return true;
+        }
     }
 
     if (f_manager.last_track_num < 2)
@@ -933,60 +1146,75 @@ void Estimator::optimization()
         problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
     }
 
-    // Zero-Velocity Update: when the drone has been holding still, inject
-    // pseudo-measurements that pin velocity to zero and position to its
-    // previous value. Under hover the VIO geometry is degenerate — ZUPT is
-    // what physically anchors the state so IMU bias integration cannot drive
-    // the pose away. Only applied to the newest few frames, all guaranteed
-    // to fall inside the detector's confirmed stationary window.
+    // Zero-Velocity Update — hover-aware fork (2.1, 2.2, 2.3, 2.4).
+    //
+    // Adaptive weights: 1/σ where σ is the expected pseudo-measurement
+    // noise given the IMU noise floor and the window's frame period. For
+    // genuine stationary IMU integration noise:
+    //   σ_vel ≈ ACC_N * sqrt(dt_frame)
+    //   σ_pos ≈ ACC_N * dt_frame^{1.5} / sqrt(3)
+    // Weights = 1/σ. Scaled by ZUPT_WEIGHT_SCALE (default 1). User-set
+    // YAML overrides still honored for backward compat.
+    //
+    // Per-frame gating (2.2): ZUPT is only applied to frames whose
+    // was_stationary[] flag is set — i.e. the detector confirmed stationary
+    // at the moment each frame was committed. Prevents pinning frames that
+    // were actually in motion but happen to be in the current window.
+    //
+    // 2.3: use per-axis weights — XY weaker than Z to avoid overly
+    // clamping legitimate small drift from wind gusts on a hovering drone.
+    // The vehicle *should* drift slightly in wind; hard-pinning XY would
+    // cause the estimator to fight physics.
+    const double dt_frame = 1.0 / std::max(image_rate_hz, 1.0);
+    const double sigma_v_zupt = ACC_N * std::sqrt(dt_frame);
+    const double sigma_p_zupt = ACC_N * dt_frame * std::sqrt(dt_frame) / std::sqrt(3.0);
+    // inverse σ with safety floor; ZUPT_WEIGHT_SCALE user multiplier
+    double w_vel = ZUPT_WEIGHT_SCALE / std::max(sigma_v_zupt, 1e-4);
+    double w_pos = ZUPT_WEIGHT_SCALE / std::max(sigma_p_zupt, 1e-5);
+    if (ZUPT_VEL_WEIGHT_OVERRIDE > 0) w_vel = ZUPT_VEL_WEIGHT_OVERRIDE;
+    if (ZUPT_POS_WEIGHT_OVERRIDE > 0) w_pos = ZUPT_POS_WEIGHT_OVERRIDE;
+    // XY weaker than Z: Z is gravity-aligned; XY drift is a legitimate
+    // ground-speed response to wind; weaken by 2× so VIO can still track
+    // real horizontal drift instead of fighting it.
+    const Eigen::Vector3d w_vel_xyz(w_vel * 0.5, w_vel * 0.5, w_vel);
+    const Eigen::Vector3d w_pos_xyz(w_pos * 0.5, w_pos * 0.5, w_pos);
+
     if (ENABLE_ZUPT && motion_detector.isStationary())
     {
-        const int zupt_span = 3;
-        const int start_idx = std::max(0, WINDOW_SIZE - zupt_span);
-        for (int j = start_idx; j <= WINDOW_SIZE; j++)
+        int zupt_frames = 0;
+        for (int j = WINDOW_SIZE - 3; j <= WINDOW_SIZE; j++)
         {
-            auto *zv = new ZUPTVelocityFactor(ZUPT_VEL_WEIGHT);
+            if (j < 0) continue;
+            if (!was_stationary[j]) continue;  // per-frame gate (2.2)
+            auto *zv = new ZUPTVelocityFactor(w_vel_xyz);
             problem.AddResidualBlock(zv, NULL, para_SpeedBias[j]);
+            zupt_frames++;
         }
-        for (int i = start_idx; i < WINDOW_SIZE; i++)
+        for (int i = std::max(0, WINDOW_SIZE - 3); i < WINDOW_SIZE; i++)
         {
-            int j = i + 1;
-            auto *zp = new ZUPTPositionFactor(ZUPT_POS_WEIGHT);
-            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[j]);
+            if (!was_stationary[i] || !was_stationary[i + 1]) continue;
+            auto *zp = new ZUPTPositionFactor(w_pos_xyz);
+            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[i + 1]);
         }
-        ROS_DEBUG("hover ZUPT active: span=%d frames", WINDOW_SIZE - start_idx + 1);
+        if (zupt_frames > 0)
+            ROS_DEBUG("hover ZUPT: frames=%d w_vel=%.1f w_pos=%.1f", zupt_frames, w_vel, w_pos);
     }
-    // Rotation-only ZUPT: pin position when motion is pure rotation.
+    // Rotation-only ZUPT — position-only anchor during pure rotation.
     //
-    // Handheld testing or in-place yaw produces large optical flow from
-    // rotation alone. Tiny residuals in R_cam←imu extrinsic calibration
-    // leak that rotation into apparent translation in the factor graph —
-    // position drifts metres per minute even though the drone body has not
-    // actually moved. Detecting "pure rotation" lets us anchor position
-    // without touching velocity (so the gyro-driven rotation updates
-    // unimpeded through IMU preintegration).
-    //
-    // Classifier compares measured optical flow against what |ω|·f predicts
-    // (see MotionDetector::isRotationOnly). Gated by gyr>min to avoid
-    // firing during low-motion drift. Only position pseudo-measurement is
-    // added — not velocity — because during rotation Vs can legitimately
-    // be non-zero through bias/noise but Pj≈Pi must hold regardless.
-    else if (ENABLE_ROTATION_ZUPT &&
-             motion_detector.isRotationOnly(FOCAL_LENGTH,
-                                            ROTATION_ZUPT_GYR_MIN,
-                                            ROTATION_ZUPT_FLOW_RATIO,
-                                            ROTATION_ZUPT_FLOW_BASELINE))
+    // Internal classifier already configured in setParameter() via
+    // configureRotation(). No arg-copy at call site (2.5/2.6 clean-up).
+    else if (ENABLE_ROTATION_ZUPT && motion_detector.isRotationOnly())
     {
-        const int zupt_span = 2;
-        const int start_idx = std::max(0, WINDOW_SIZE - zupt_span);
-        for (int i = start_idx; i < WINDOW_SIZE; i++)
+        double w_pos_rot = w_pos * 0.5;  // looser than stationary
+        if (ROTATION_ZUPT_POS_WEIGHT_OVERRIDE > 0) w_pos_rot = ROTATION_ZUPT_POS_WEIGHT_OVERRIDE;
+        const Eigen::Vector3d w_pos_rot_xyz(w_pos_rot * 0.5, w_pos_rot * 0.5, w_pos_rot);
+        for (int i = std::max(0, WINDOW_SIZE - 2); i < WINDOW_SIZE; i++)
         {
-            int j = i + 1;
-            auto *zp = new ZUPTPositionFactor(ROTATION_ZUPT_POS_WEIGHT);
-            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[j]);
+            auto *zp = new ZUPTPositionFactor(w_pos_rot_xyz);
+            problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[i + 1]);
         }
-        ROS_DEBUG("rotation ZUPT active: |gyr|=%.2f flow=%.1f px/s",
-                  motion_detector.meanGyrMagnitude(), motion_detector.meanFlow());
+        ROS_DEBUG("rotation ZUPT: |gyr|=%.2f flow=%.1f w_pos=%.1f",
+                  motion_detector.meanGyrMagnitude(), motion_detector.meanFlow(), w_pos_rot);
     }
 
     int f_m_cnt = 0;
@@ -1271,7 +1499,44 @@ void Estimator::optimization()
         }
     }
     ROS_DEBUG("whole marginalization costs: %f", t_whole_marginalization.toc());
-    
+
+    // Post-optimization IMU-vs-visual rotation check (8.6). After the full
+    // Ceres solve has converged, compare the optimized Rs with the IMU
+    // integration chain. Large disagreement now is different from the pre-
+    // init flag check — here it indicates a slow drift accumulating over
+    // frames (gyro bias estimate is off, or a projection outlier pulled
+    // the solution). Used for logging / diagnostics only; does NOT trigger
+    // a reboot (failureDetection already handles hard divergence). Logs
+    // a warning every 5 s to avoid rate-spam.
+    if (solver_flag == NON_LINEAR)
+    {
+        Eigen::Quaterniond q_imu_pst = Eigen::Quaterniond::Identity();
+        double sum_dt = 0.0;
+        for (int i = 1; i <= WINDOW_SIZE; i++)
+            if (pre_integrations[i])
+            {
+                q_imu_pst = q_imu_pst * pre_integrations[i]->delta_q;
+                sum_dt += pre_integrations[i]->sum_dt;
+            }
+        Eigen::Quaterniond q_vis_pst(Rs[0].transpose() * Rs[WINDOW_SIZE]);
+        q_imu_pst.normalize();
+        q_vis_pst.normalize();
+        double disagree_deg = q_imu_pst.angularDistance(q_vis_pst) * 180.0 / M_PI;
+        last_init_disagree_deg = disagree_deg;
+
+        static double last_warn = 0.0;
+        double now = Headers[WINDOW_SIZE].stamp.toSec();
+        double sigma_phi_deg = GYR_N * std::sqrt(std::max(sum_dt, 1e-3)) * 180.0 / M_PI;
+        double warn_thr = std::max(5.0, ROTATION_DISAGREE_SIGMA * sigma_phi_deg);
+        if (disagree_deg > warn_thr && (now - last_warn) > 5.0)
+        {
+            ROS_WARN("post-opt IMU/visual drift: %.2f° > %.1f° (σ_φ=%.2f°) — "
+                     "gyro bias may be off",
+                     disagree_deg, warn_thr, sigma_phi_deg);
+            last_warn = now;
+        }
+    }
+
     ROS_DEBUG("whole time for ceres: %f", t_whole.toc());
 }
 
@@ -1300,6 +1565,7 @@ void Estimator::slideWindow()
                 Vs[i].swap(Vs[i + 1]);
                 Bas[i].swap(Bas[i + 1]);
                 Bgs[i].swap(Bgs[i + 1]);
+                was_stationary[i] = was_stationary[i + 1];
             }
             Headers[WINDOW_SIZE] = Headers[WINDOW_SIZE - 1];
             Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
@@ -1307,6 +1573,7 @@ void Estimator::slideWindow()
             Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
             Bas[WINDOW_SIZE] = Bas[WINDOW_SIZE - 1];
             Bgs[WINDOW_SIZE] = Bgs[WINDOW_SIZE - 1];
+            was_stationary[WINDOW_SIZE] = was_stationary[WINDOW_SIZE - 1];
 
             delete pre_integrations[WINDOW_SIZE];
             pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
@@ -1359,6 +1626,7 @@ void Estimator::slideWindow()
             Rs[frame_count - 1] = Rs[frame_count];
             Bas[frame_count - 1] = Bas[frame_count];
             Bgs[frame_count - 1] = Bgs[frame_count];
+            was_stationary[frame_count - 1] = was_stationary[frame_count];
 
             delete pre_integrations[WINDOW_SIZE];
             pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};

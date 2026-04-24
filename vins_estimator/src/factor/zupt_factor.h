@@ -3,24 +3,35 @@
 #include <ceres/ceres.h>
 #include <eigen3/Eigen/Dense>
 
-// Zero-Velocity Update (ZUPT) factors used when the platform is detected to
-// be stationary. They inject pseudo-measurements that the velocity is zero
-// and that consecutive positions are equal, which stops IMU-integrated drift
-// during prolonged hover — the regime where VIO is geometrically starved.
+// Zero-Velocity Update (ZUPT) factors for the hover-aware fork.
 //
-// Weights are configured from YAML (see ZUPT_VEL_WEIGHT / ZUPT_POS_WEIGHT).
-// Intuition: weight ≈ 1 / sigma, where sigma is the expected noise of the
-// pseudo-measurement. For a drone hovering on attitude-hold, residual drift
-// is typically ~1 cm/s in velocity and < 1 mm between frames in position,
-// which maps to weights of ~100 and ~1000 respectively.
+// Injected into the Ceres problem when the motion detector confirms the
+// platform is stationary (velocity-and-position pin), or rotating in place
+// (position-only pin). They stop IMU-bias-driven drift during prolonged
+// hover, the regime where visual parallax is degenerate.
+//
+// The sqrt-information scaling is adaptive — computed in estimator.cpp from
+// the IMU noise model (ACC_N) and the observed frame period so the weights
+// reflect the *actual* pseudo-measurement noise, not a hardcoded constant.
+// Per-axis weights are supported so Z (gravity-aligned in world frame) can
+// be decoupled from XY when needed.
 
-// Residual (3): velocity in world frame at a single window index.
-// Parameter block: para_SpeedBias[j] (9: [V(3) Ba(3) Bg(3)]).
 class ZUPTVelocityFactor : public ceres::SizedCostFunction<3, 9>
 {
   public:
-    explicit ZUPTVelocityFactor(double weight)
-        : sqrt_info_(weight * Eigen::Matrix3d::Identity()) {}
+    explicit ZUPTVelocityFactor(double weight) { setWeight(weight); }
+    explicit ZUPTVelocityFactor(const Eigen::Vector3d &weight_xyz) { setWeight(weight_xyz); }
+
+    void setWeight(double weight)
+    { sqrt_info_ = weight * Eigen::Matrix3d::Identity(); }
+
+    void setWeight(const Eigen::Vector3d &weight_xyz)
+    {
+        sqrt_info_.setZero();
+        sqrt_info_(0, 0) = weight_xyz(0);
+        sqrt_info_(1, 1) = weight_xyz(1);
+        sqrt_info_(2, 2) = weight_xyz(2);
+    }
 
     virtual bool Evaluate(double const *const *parameters,
                           double *residuals,
@@ -43,13 +54,22 @@ class ZUPTVelocityFactor : public ceres::SizedCostFunction<3, 9>
     Eigen::Matrix3d sqrt_info_;
 };
 
-// Residual (3): position delta Pj - Pi in world frame.
-// Parameter blocks: para_Pose[i], para_Pose[j] (7 each: [P(3) Q(4)]).
 class ZUPTPositionFactor : public ceres::SizedCostFunction<3, 7, 7>
 {
   public:
-    explicit ZUPTPositionFactor(double weight)
-        : sqrt_info_(weight * Eigen::Matrix3d::Identity()) {}
+    explicit ZUPTPositionFactor(double weight) { setWeight(weight); }
+    explicit ZUPTPositionFactor(const Eigen::Vector3d &weight_xyz) { setWeight(weight_xyz); }
+
+    void setWeight(double weight)
+    { sqrt_info_ = weight * Eigen::Matrix3d::Identity(); }
+
+    void setWeight(const Eigen::Vector3d &weight_xyz)
+    {
+        sqrt_info_.setZero();
+        sqrt_info_(0, 0) = weight_xyz(0);
+        sqrt_info_(1, 1) = weight_xyz(1);
+        sqrt_info_(2, 2) = weight_xyz(2);
+    }
 
     virtual bool Evaluate(double const *const *parameters,
                           double *residuals,

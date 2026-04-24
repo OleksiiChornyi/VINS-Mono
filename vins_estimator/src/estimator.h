@@ -33,7 +33,19 @@ class Estimator
     void setParameter();
 
     // interface
-    void processIMU(double t, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
+    //
+    // processIMU(dt, t, acc, gyr) — `dt` is the IMU integration step, `t` is
+    // the absolute ROS timestamp (seconds) of this IMU sample. `t` feeds the
+    // MotionDetector on the same timebase as image pushes, so the rolling
+    // window is coherent even when online-td offsets or auto-reset events
+    // shift the estimator's internal clocks.
+    //
+    // The legacy 3-argument overload (dt only) is kept for any external user
+    // of this class; it synthesises `t` from an internal accumulator — works
+    // for most cases but is susceptible to reset-caused timing glitches, so
+    // prefer the 4-argument form.
+    void processIMU(double dt, double t, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
+    void processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
     void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header);
     void setReloFrame(double _frame_stamp, int _frame_index, vector<Vector3d> &_match_points, Vector3d _relo_t, Matrix3d _relo_r);
 
@@ -143,5 +155,26 @@ class Estimator
     // priming, and softened failure detection.
     MotionDetector motion_detector;
     double last_image_t;
-    double imu_clock;
+    double imu_clock;          // fallback monotonic clock (legacy path)
+    double last_imu_t;         // absolute ROS timestamp of latest IMU sample
+
+    // Per-frame stationary flag in the window. Set when processImage commits
+    // a frame while MotionDetector reports STATIONARY; allows ZUPT to fire
+    // only for frames that were genuinely still at capture time, not for
+    // frames that happened to be the newest in the window.
+    bool was_stationary[(WINDOW_SIZE + 1)];
+
+    // Safety-reset escalation (hover-aware). Counts how many all_image_frame
+    // overflow resets happened in the current run; used to widen the
+    // tolerance window on each retry so a marginal scene does not bootloop.
+    int  init_safety_reset_count;
+    double last_safety_reset_t;
+
+    // Image rate, used for scaling time-dependent thresholds (e.g. the
+    // all_image_frame overflow cap). Measured from consecutive image pushes.
+    double image_rate_hz;
+
+    // Last observed rotation disagreement between IMU and visual alignment,
+    // kept as a post-init diagnostic; logged by the optimizer.
+    double last_init_disagree_deg;
 };
