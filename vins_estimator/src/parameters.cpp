@@ -24,23 +24,41 @@ double ROW, COL;
 double TD, TR;
 
 int    ENABLE_ZUPT;
-double ZUPT_VEL_WEIGHT;
-double ZUPT_POS_WEIGHT;
 double STATIC_ACC_THR;
 double STATIC_GYR_THR;
 double STATIC_FLOW_THR;
 double STATIC_WINDOW_SEC;
-double STATIC_HOLD_SEC;
+int    STATIC_CONFIRM_CYCLES;
 int    STATIC_INIT_BIAS_PRIMING;
 int    SOFTEN_FAILURE_ON_HOVER;
-double HOVER_MIN_PARALLAX_FACTOR;
-double INIT_MAX_VELOCITY;
-double GRAVITY_CHECK_ANGLE_DEG;
 int    ENABLE_ROTATION_ZUPT;
 double ROTATION_ZUPT_GYR_MIN;
 double ROTATION_ZUPT_FLOW_RATIO;
 double ROTATION_ZUPT_FLOW_BASELINE;
-double ROTATION_ZUPT_POS_WEIGHT;
+
+double GRAVITY_CHECK_SIGMA;
+double ROTATION_DISAGREE_SIGMA;
+double INIT_MAX_VEL_COEF;
+double ZUPT_WEIGHT_SCALE;
+double INIT_PARALLAX_PX;
+
+double RUNAWAY_IMU_SIGMA;
+
+double IDLE_RESET_SECONDS;
+int    IDLE_RESET_MAX_ATTEMPTS;
+
+double VEHICLE_MAX_ACCEL;
+double VEHICLE_MAX_SPEED;
+
+// Optional overrides kept for backward-compatibility with the previous
+// fork's YAML. If > 0, they replace the adaptive computation; ≤ 0 means
+// "use adaptive" (recommended). Not documented as first-class knobs.
+double ZUPT_VEL_WEIGHT_OVERRIDE;
+double ZUPT_POS_WEIGHT_OVERRIDE;
+double ROTATION_ZUPT_POS_WEIGHT_OVERRIDE;
+double INIT_MAX_VELOCITY_OVERRIDE;
+double GRAVITY_CHECK_ANGLE_DEG_OVERRIDE;
+double RUNAWAY_V_ABS_OVERRIDE;
 
 template <typename T>
 T readParam(ros::NodeHandle &n, std::string name)
@@ -167,31 +185,65 @@ void readParameters(ros::NodeHandle &n)
     };
 
     ENABLE_ZUPT              = readOrInt("enable_zupt",              1);
-    ZUPT_VEL_WEIGHT          = readOr   ("zupt_vel_weight",          100.0);
-    ZUPT_POS_WEIGHT          = readOr   ("zupt_pos_weight",          1000.0);
     STATIC_ACC_THR           = readOr   ("static_acc_thr",           0.5);
     STATIC_GYR_THR           = readOr   ("static_gyr_thr",           0.05);
     STATIC_FLOW_THR          = readOr   ("static_flow_thr",          2.0);
     STATIC_WINDOW_SEC        = readOr   ("static_window_sec",        0.5);
-    STATIC_HOLD_SEC          = readOr   ("static_hold_sec",          0.5);
+    // Hysteresis is in evaluate()-cycles, not seconds. At ~200 Hz IMU rate
+    // 3 cycles ≈ 15 ms confirmation delay — fast enough for a drone yet
+    // robust against single-sample spikes.
+    STATIC_CONFIRM_CYCLES    = readOrInt("static_confirm_cycles",    3);
     STATIC_INIT_BIAS_PRIMING = readOrInt("static_init_bias_priming", 1);
     SOFTEN_FAILURE_ON_HOVER  = readOrInt("soften_failure_on_hover",  1);
-    HOVER_MIN_PARALLAX_FACTOR = readOr  ("hover_min_parallax_factor", 0.5);
-    INIT_MAX_VELOCITY           = readOr   ("init_max_velocity",           3.0);
-    GRAVITY_CHECK_ANGLE_DEG     = readOr   ("gravity_check_angle_deg",     8.0);
-    ENABLE_ROTATION_ZUPT        = readOrInt("enable_rotation_zupt",        1);
-    ROTATION_ZUPT_GYR_MIN       = readOr   ("rotation_zupt_gyr_min",       0.3);
-    ROTATION_ZUPT_FLOW_RATIO    = readOr   ("rotation_zupt_flow_ratio",    1.3);
-    ROTATION_ZUPT_FLOW_BASELINE = readOr   ("rotation_zupt_flow_baseline", 30.0);
-    ROTATION_ZUPT_POS_WEIGHT    = readOr   ("rotation_zupt_pos_weight",    500.0);
+    ENABLE_ROTATION_ZUPT     = readOrInt("enable_rotation_zupt",     1);
+    ROTATION_ZUPT_GYR_MIN    = readOr   ("rotation_zupt_gyr_min",    0.3);
+    ROTATION_ZUPT_FLOW_RATIO = readOr   ("rotation_zupt_flow_ratio", 1.3);
+    ROTATION_ZUPT_FLOW_BASELINE = readOr("rotation_zupt_flow_baseline", 30.0);
 
-    ROS_INFO("hover-aware: zupt=%d (v=%.1f p=%.1f) acc_thr=%.3f gyr_thr=%.3f flow_thr=%.2f hold=%.2fs",
-             ENABLE_ZUPT, ZUPT_VEL_WEIGHT, ZUPT_POS_WEIGHT,
-             STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR, STATIC_HOLD_SEC);
-    ROS_INFO("hover-aware: init_vmax=%.1f m/s, g_check=%.1f deg, rot_zupt=%d (gyr_min=%.2f, ratio=%.2f, baseline=%.0fpx, w=%.0f)",
-             INIT_MAX_VELOCITY, GRAVITY_CHECK_ANGLE_DEG,
-             ENABLE_ROTATION_ZUPT, ROTATION_ZUPT_GYR_MIN, ROTATION_ZUPT_FLOW_RATIO,
-             ROTATION_ZUPT_FLOW_BASELINE, ROTATION_ZUPT_POS_WEIGHT);
+    // Adaptive-threshold scale factors. Defaults = 1 mean "use the derived
+    // value as-is"; tune >1 to loosen, <1 to tighten.
+    GRAVITY_CHECK_SIGMA      = readOr   ("gravity_check_sigma",      6.0);
+    ROTATION_DISAGREE_SIGMA  = readOr   ("rotation_disagree_sigma",  8.0);
+    INIT_MAX_VEL_COEF        = readOr   ("init_max_vel_coef",        1.5);
+    ZUPT_WEIGHT_SCALE        = readOr   ("zupt_weight_scale",        1.0);
+    // Parallax threshold in normalized-FOCAL pixel units (FOCAL_LENGTH=460
+    // by VINS convention). Same value works across camera resolutions
+    // because features are normalized before parallax is computed.
+    INIT_PARALLAX_PX         = readOr   ("init_parallax_px",         18.0);
+
+    RUNAWAY_IMU_SIGMA        = readOr   ("runaway_imu_sigma",        6.0);
+
+    IDLE_RESET_SECONDS       = readOr   ("idle_reset_seconds",       15.0);
+    IDLE_RESET_MAX_ATTEMPTS  = readOrInt("idle_reset_max_attempts",  3);
+
+    // Platform-level physics limits. These are *vehicle* constants, not
+    // per-flight tuning. Defaults are for a small multirotor; larger
+    // airframes need higher. The bridge uses accel as a "spike-filter
+    // warning" and speed as the "hard divergence" cutoff, so setting
+    // them generously is safer than tightly.
+    VEHICLE_MAX_ACCEL        = readOr   ("vehicle_max_accel",        30.0);
+    VEHICLE_MAX_SPEED        = readOr   ("vehicle_max_speed",        20.0);
+
+    // Legacy overrides (≤0 → adaptive).
+    ZUPT_VEL_WEIGHT_OVERRIDE        = readOr("zupt_vel_weight",         -1.0);
+    ZUPT_POS_WEIGHT_OVERRIDE        = readOr("zupt_pos_weight",         -1.0);
+    ROTATION_ZUPT_POS_WEIGHT_OVERRIDE = readOr("rotation_zupt_pos_weight", -1.0);
+    INIT_MAX_VELOCITY_OVERRIDE      = readOr("init_max_velocity",       -1.0);
+    GRAVITY_CHECK_ANGLE_DEG_OVERRIDE = readOr("gravity_check_angle_deg", -1.0);
+    RUNAWAY_V_ABS_OVERRIDE          = readOr("runaway_v_abs",           -1.0);
+
+    ROS_INFO("hover-aware: zupt=%d acc_thr=%.3f gyr_thr=%.3f flow_thr=%.2f window=%.2fs cycles=%d",
+             ENABLE_ZUPT, STATIC_ACC_THR, STATIC_GYR_THR, STATIC_FLOW_THR,
+             STATIC_WINDOW_SEC, STATIC_CONFIRM_CYCLES);
+    ROS_INFO("hover-aware: adaptive sigmas g=%.1f rot=%.1f vmax_coef=%.1f zupt_scale=%.2f parallax_px=%.1f",
+             GRAVITY_CHECK_SIGMA, ROTATION_DISAGREE_SIGMA, INIT_MAX_VEL_COEF,
+             ZUPT_WEIGHT_SCALE, INIT_PARALLAX_PX);
+    ROS_INFO("hover-aware: idle_reset=%.1fs (max %d), runaway_imu_sigma=%.1f, vehicle max a=%.1f v=%.1f",
+             IDLE_RESET_SECONDS, IDLE_RESET_MAX_ATTEMPTS, RUNAWAY_IMU_SIGMA,
+             VEHICLE_MAX_ACCEL, VEHICLE_MAX_SPEED);
+    ROS_INFO("hover-aware: rot_zupt=%d (gyr_min=%.2f, ratio=%.2f, baseline=%.0fpx)",
+             ENABLE_ROTATION_ZUPT, ROTATION_ZUPT_GYR_MIN,
+             ROTATION_ZUPT_FLOW_RATIO, ROTATION_ZUPT_FLOW_BASELINE);
 
     fsSettings.release();
 }

@@ -1,262 +1,318 @@
 #pragma once
 
 #include <deque>
+#include <vector>
+#include <algorithm>
 #include <cmath>
 #include <eigen3/Eigen/Dense>
 
 // Rolling-window motion classifier used by the hover-aware fork.
 //
-// Answers three related questions about the last window_sec seconds:
+// Design goals addressed in this revision:
+//   * Single timebase — all pushes take an externally-supplied ROS timestamp,
+//     IMU and flow buffers live on the same clock so the rolling window is
+//     coherent when image-rate and IMU-rate drift apart, when a camera drops
+//     frames for a sub-second gap, or when online-td shifts the IMU clock.
+//   * Outlier-robust classification — percentile-based quietness tests ignore
+//     isolated acc spikes (motor vibration, prop wash), gyro pulses (impacts)
+//     and single flying objects across the visual field (bird, cable, leaf).
+//     Thresholds act on the 90th percentile, so up to 10% outliers in the
+//     window can't flip the classification on their own.
+//   * Trimmed-mean robust statistics — gravity-in-body reference and gyro
+//     bias priming use a trimmed mean (~14% cut at each tail), preserving
+//     the central tendency of genuine motion while dropping extreme outliers.
+//   * Cycle-count hysteresis state machine — transitions between MOVING /
+//     ROTATION_ONLY / STATIONARY require N consecutive identical raw
+//     classifications. No wall-clock dependency — the count is in
+//     evaluate()-cycles, so at IMU rate the confirmation delay is typically
+//     ~15 ms (3 cycles at 200 Hz).
 //
-//   1. isStationary()   — accelerometer ≈ gravity, gyro ≈ 0, flow ≈ 0.
-//                         Gates ZUPT, static-init bias priming, and failure
-//                         softening.
-//
-//   2. isRotationOnly(focal_px) — gyroscope shows significant angular rate
-//                         but the optical flow is explainable by rotation
-//                         alone (no residual translational flow). True for
-//                         a handheld device being panned/tilted in place,
-//                         or a drone yawing at a stationary hover point.
-//                         Used to apply a position-only ZUPT when VIO's
-//                         translation estimate would otherwise drift due
-//                         to extrinsic calibration errors leaking rotation
-//                         into translation.
-//
-//   3. hasStationaryReference() / stationaryReferenceAcc() — the most
-//                         recent meanAcc observed while isStationary() was
-//                         true. Survives the transition out of stationary,
-//                         so a post-init gravity-direction sanity check
-//                         can run AGAINST this reference even when init
-//                         completes during takeoff motion.
+// Public classifications:
+//   1. STATIONARY    — accelerometer ≈ gravity, gyro ≈ 0, flow ≈ 0.
+//                      Gates ZUPT, static init bias priming, failure
+//                      softening.
+//   2. ROTATION_ONLY — gyroscope significantly excited, but optical flow is
+//                      explainable by rotation alone. Gates rotation-only
+//                      position ZUPT.
+//   3. MOVING        — anything else. Default.
 class MotionDetector
 {
 public:
-    MotionDetector()
-        : first_still_t_(-1.0),
-          is_still_(false),
-          last_t_(-1.0),
-          last_flow_t_(-1.0),
-          have_still_ref_(false),
-          acc_thr_(0.5),
-          gyr_thr_(0.05),
-          flow_thr_(2.0),
-          window_sec_(0.5),
-          hold_sec_(0.5),
-          gravity_norm_(9.81)
-    {}
+    enum class State { UNKNOWN, STATIONARY, ROTATION_ONLY, MOVING };
+
+    MotionDetector() { reset(); }
 
     void configure(double acc_thr, double gyr_thr, double flow_thr,
-                   double window_sec, double hold_sec, double gravity_norm)
+                   double window_sec, int min_samples,
+                   double gravity_norm, int confirm_cycles)
     {
-        acc_thr_     = acc_thr;
-        gyr_thr_     = gyr_thr;
-        flow_thr_    = flow_thr;
-        window_sec_  = window_sec;
-        hold_sec_    = hold_sec;
-        gravity_norm_ = gravity_norm;
+        acc_thr_        = acc_thr;
+        gyr_thr_        = gyr_thr;
+        flow_thr_       = flow_thr;
+        window_sec_     = window_sec;
+        min_samples_    = std::max(4, min_samples);
+        gravity_norm_   = gravity_norm;
+        confirm_cycles_ = std::max(1, confirm_cycles);
     }
 
+    void configureRotation(double gyr_min, double ratio, double baseline)
+    {
+        gyr_rot_min_   = gyr_min;
+        flow_ratio_    = ratio;
+        flow_baseline_ = baseline;
+    }
+
+    // Lever arm from IMU origin to camera origin (imu^T_cam). Used to
+    // include the rotation-induced translation at the camera in the
+    // rotation-only classifier; matches VINS-Mono's TIC[0] convention.
+    void setLeverArm(const Eigen::Vector3d &t_ic) { t_ic_ = t_ic; have_lever_ = true; }
+    void setExtrinsicR(const Eigen::Matrix3d &R_ic) { R_ic_ = R_ic; have_R_ic_ = true; }
+    void setFocalLength(double f) { focal_ = f; }
+
+    // Clears transient state only; preserves configured thresholds so a
+    // post-reset detector behaves identically without re-calling configure.
     void reset()
     {
         imu_buf_.clear();
         flow_buf_.clear();
-        first_still_t_ = -1.0;
-        is_still_      = false;
-        last_t_        = -1.0;
-        last_flow_t_   = -1.0;
+        still_cnt_ = rot_only_cnt_ = move_cnt_ = 0;
+        state_ = State::UNKNOWN;
         have_still_ref_ = false;
         still_ref_acc_.setZero();
+        still_ref_gyr_.setZero();
+        still_ref_acc_std_ = 0.0;
+        last_t_ = -1.0;
     }
 
+    // IMU push. `t` is an external monotonic timestamp (ROS header stamp,
+    // seconds). IMU and flow pushes MUST share the same clock.
     void pushIMU(double t, const Eigen::Vector3d &acc, const Eigen::Vector3d &gyr)
     {
         imu_buf_.push_back({t, acc, gyr});
-        trimWindow(imu_buf_, t);
-        last_t_ = t;
+        if (t > last_t_) last_t_ = t;
+        trimBoth(last_t_);
         evaluate();
     }
 
+    // Preferred image push: pass per-feature flow magnitudes (px/s). We
+    // median-reduce per-image before pushing to time buffer, so a single
+    // object crossing the field of view does not bias the aggregate.
+    void pushFlowSamples(double t, const std::vector<double> &flows_px_per_sec)
+    {
+        double med = 0.0;
+        if (!flows_px_per_sec.empty())
+        {
+            std::vector<double> v = flows_px_per_sec;
+            auto mid = v.begin() + v.size() / 2;
+            std::nth_element(v.begin(), mid, v.end());
+            med = *mid;
+        }
+        flow_buf_.push_back({t, med});
+        if (t > last_t_) last_t_ = t;
+        trimBoth(last_t_);
+    }
+
+    // Backward-compat overload: single scalar flow.
     void pushFlow(double t, double flow_px_per_sec)
     {
         flow_buf_.push_back({t, flow_px_per_sec});
-        trimFlowWindow(flow_buf_, t);
-        last_flow_t_ = t;
+        if (t > last_t_) last_t_ = t;
+        trimBoth(last_t_);
     }
 
-    bool isStationary() const { return is_still_; }
+    State state() const { return state_; }
+    bool isStationary()   const { return state_ == State::STATIONARY; }
+    bool isRotationOnly() const { return state_ == State::ROTATION_ONLY; }
 
-    double stationaryDuration() const
-    {
-        if (first_still_t_ < 0 || last_t_ < 0) return 0.0;
-        return last_t_ - first_still_t_;
-    }
+    int imuCount()  const { return (int)imu_buf_.size(); }
+    int flowCount() const { return (int)flow_buf_.size(); }
 
-    Eigen::Vector3d meanGyr() const
-    {
-        Eigen::Vector3d s = Eigen::Vector3d::Zero();
-        if (imu_buf_.empty()) return s;
-        for (const auto &e : imu_buf_) s += e.gyr;
-        return s / double(imu_buf_.size());
-    }
+    Eigen::Vector3d meanGyr() const { return trimmedMeanVec3Gyr(); }
+    Eigen::Vector3d meanAcc() const { return trimmedMeanVec3Acc(); }
 
-    Eigen::Vector3d meanAcc() const
-    {
-        Eigen::Vector3d s = Eigen::Vector3d::Zero();
-        if (imu_buf_.empty()) return s;
-        for (const auto &e : imu_buf_) s += e.acc;
-        return s / double(imu_buf_.size());
-    }
-
-    // Mean angular-rate magnitude (not magnitude of mean — different when
-    // gyro has DC bias). Used by rotation-only classifier.
     double meanGyrMagnitude() const
     {
-        if (imu_buf_.empty()) return 0.0;
-        double s = 0.0;
-        for (const auto &e : imu_buf_) s += e.gyr.norm();
-        return s / double(imu_buf_.size());
-    }
-
-    // Peak |acc - g| seen over the window. Non-zero during motor spin-up
-    // and sharp thrust transients; used by init to recognise "we are in
-    // a takeoff event" and apply stricter acceptance criteria.
-    double peakAccDeviation() const
-    {
-        double m = 0.0;
-        for (const auto &e : imu_buf_)
-        {
-            double d = std::fabs(e.acc.norm() - gravity_norm_);
-            if (d > m) m = d;
-        }
-        return m;
+        std::vector<double> m; m.reserve(imu_buf_.size());
+        for (const auto &e : imu_buf_) m.push_back(e.gyr.norm());
+        return trimmedMeanScalar(m);
     }
 
     double meanFlow() const
     {
-        if (flow_buf_.empty()) return 0.0;
-        double s = 0.0;
-        for (const auto &e : flow_buf_) s += e.second;
-        return s / double(flow_buf_.size());
+        std::vector<double> m; m.reserve(flow_buf_.size());
+        for (const auto &e : flow_buf_) m.push_back(e.second);
+        return trimmedMeanScalar(m);
     }
 
-    int imuCount() const { return (int)imu_buf_.size(); }
-    int flowCount() const { return (int)flow_buf_.size(); }
+    double peakAccDeviation() const
+    {
+        double mx = 0.0;
+        for (const auto &e : imu_buf_)
+            mx = std::max(mx, std::fabs(e.acc.norm() - gravity_norm_));
+        return mx;
+    }
 
-    // Last meanAcc sampled while the detector was confirmed stationary.
-    // Valid for the entire session once the device has been held still
-    // at any point (typical: pre-arm on the ground).
     bool hasStationaryReference() const { return have_still_ref_; }
-    const Eigen::Vector3d& stationaryReferenceAcc() const { return still_ref_acc_; }
+    const Eigen::Vector3d &stationaryReferenceAcc() const { return still_ref_acc_; }
+    const Eigen::Vector3d &stationaryReferenceGyr() const { return still_ref_gyr_; }
+    double stationaryAccNoise() const { return still_ref_acc_std_; }
 
-    // Pure rotation classifier.
-    //
-    // Intuition: for a rigid rotation at angular rate ω with no translation,
-    // the optical flow of an off-centre feature is approximately |ω|·f (in
-    // pixels/sec), where f is the focal length. Translational flow is
-    // (|v|/depth)·f; for handheld distances (~1–3 m) even small translation
-    // produces flow comparable to rotational flow, so the ratio discriminates
-    // rotation-only from general motion.
-    //
-    //   flow_measured < ratio · |ω|·f + baseline
-    // is the acceptance rule. ratio ~ 1.3 is forgiving to feature depth
-    // spread; baseline absorbs tracker noise at low ω.
-    //
-    // Gated on |ω| > gyr_min to avoid misclassifying slow translation as
-    // rotation-dominated (where division/ratio thresholds become unstable).
+    // Backward-compat classifier (parameters overridden at call site).
     bool isRotationOnly(double focal_px, double gyr_min_rad_s,
                         double flow_ratio, double flow_baseline_px) const
     {
-        if (imu_buf_.size() < 4) return false;
-        if (flow_buf_.empty())   return false;  // need visual evidence
-
-        double mean_gyr_mag = meanGyrMagnitude();
-        if (mean_gyr_mag < gyr_min_rad_s) return false;
-
-        double predicted_flow = mean_gyr_mag * focal_px;
-        double measured_flow  = meanFlow();
-        return measured_flow < flow_ratio * predicted_flow + flow_baseline_px;
+        if ((int)imu_buf_.size() < 4 || flow_buf_.empty()) return false;
+        double mg = meanGyrMagnitude();
+        if (mg < gyr_min_rad_s) return false;
+        return meanFlow() < flow_ratio * mg * focal_px + flow_baseline_px;
     }
 
 private:
     struct ImuSample { double t; Eigen::Vector3d acc; Eigen::Vector3d gyr; };
 
-    void trimWindow(std::deque<ImuSample> &buf, double now)
+    Eigen::Vector3d trimmedMeanVec3Acc() const
     {
-        while (!buf.empty() && now - buf.front().t > window_sec_)
-            buf.pop_front();
+        if (imu_buf_.empty()) return Eigen::Vector3d::Zero();
+        std::vector<double> xs, ys, zs;
+        xs.reserve(imu_buf_.size()); ys.reserve(imu_buf_.size()); zs.reserve(imu_buf_.size());
+        for (const auto &s : imu_buf_)
+        {
+            xs.push_back(s.acc.x()); ys.push_back(s.acc.y()); zs.push_back(s.acc.z());
+        }
+        return Eigen::Vector3d(trimmedMeanScalar(xs),
+                               trimmedMeanScalar(ys),
+                               trimmedMeanScalar(zs));
     }
 
-    void trimFlowWindow(std::deque<std::pair<double,double>> &buf, double now)
+    Eigen::Vector3d trimmedMeanVec3Gyr() const
     {
-        while (!buf.empty() && now - buf.front().first > window_sec_)
-            buf.pop_front();
+        if (imu_buf_.empty()) return Eigen::Vector3d::Zero();
+        std::vector<double> xs, ys, zs;
+        xs.reserve(imu_buf_.size()); ys.reserve(imu_buf_.size()); zs.reserve(imu_buf_.size());
+        for (const auto &s : imu_buf_)
+        {
+            xs.push_back(s.gyr.x()); ys.push_back(s.gyr.y()); zs.push_back(s.gyr.z());
+        }
+        return Eigen::Vector3d(trimmedMeanScalar(xs),
+                               trimmedMeanScalar(ys),
+                               trimmedMeanScalar(zs));
+    }
+
+    // ~14% cut per tail trimmed mean.
+    double trimmedMeanScalar(std::vector<double> v) const
+    {
+        if (v.empty()) return 0.0;
+        const int n = (int)v.size();
+        std::sort(v.begin(), v.end());
+        int cut = n / 7;
+        int lo = cut, hi = n - cut;
+        if (hi <= lo) { lo = 0; hi = n; }
+        double s = 0.0;
+        for (int i = lo; i < hi; ++i) s += v[i];
+        return s / double(hi - lo);
+    }
+
+    static double percentile(std::vector<double> &v, double p)
+    {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        int k = (int)std::round((v.size() - 1) * p);
+        if (k < 0) k = 0;
+        if (k >= (int)v.size()) k = (int)v.size() - 1;
+        return v[k];
+    }
+
+    void trimBoth(double now)
+    {
+        while (!imu_buf_.empty()  && now - imu_buf_.front().t     > window_sec_) imu_buf_.pop_front();
+        while (!flow_buf_.empty() && now - flow_buf_.front().first > window_sec_) flow_buf_.pop_front();
     }
 
     void evaluate()
     {
-        if (imu_buf_.size() < 4) { is_still_ = false; first_still_t_ = -1.0; return; }
+        if ((int)imu_buf_.size() < min_samples_) return;
 
-        double acc_dev_max = 0.0;
-        double gyr_max     = 0.0;
+        std::vector<double> acc_dev; acc_dev.reserve(imu_buf_.size());
+        std::vector<double> gyr_mag; gyr_mag.reserve(imu_buf_.size());
         for (const auto &e : imu_buf_)
         {
-            double acc_dev = std::fabs(e.acc.norm() - gravity_norm_);
-            if (acc_dev > acc_dev_max) acc_dev_max = acc_dev;
-            double g = e.gyr.norm();
-            if (g > gyr_max) gyr_max = g;
+            acc_dev.push_back(std::fabs(e.acc.norm() - gravity_norm_));
+            gyr_mag.push_back(e.gyr.norm());
+        }
+        double p90_acc = percentile(acc_dev, 0.90);
+        double p90_gyr = percentile(gyr_mag, 0.90);
+        double p50_gyr = percentile(gyr_mag, 0.50);
+
+        double p90_flow = 0.0;
+        const bool have_flow = !flow_buf_.empty();
+        if (have_flow)
+        {
+            std::vector<double> f; f.reserve(flow_buf_.size());
+            for (const auto &e : flow_buf_) f.push_back(e.second);
+            p90_flow = percentile(f, 0.90);
         }
 
-        bool imu_still = (acc_dev_max < acc_thr_) && (gyr_max < gyr_thr_);
+        bool imu_quiet  = (p90_acc < acc_thr_) && (p90_gyr < gyr_thr_);
+        bool flow_quiet = !have_flow || (p90_flow < flow_thr_);
+        bool raw_still  = imu_quiet && flow_quiet;
 
-        bool flow_still = true;
-        if (!flow_buf_.empty())
+        bool raw_rot = false;
+        if (!raw_still && have_flow && p50_gyr > gyr_rot_min_)
         {
-            double flow_sum = 0.0;
-            for (const auto &e : flow_buf_) flow_sum += e.second;
-            double flow_avg = flow_sum / double(flow_buf_.size());
-            flow_still = (flow_avg < flow_thr_);
+            double predicted = p50_gyr * focal_;
+            raw_rot = p90_flow < flow_ratio_ * predicted + flow_baseline_;
         }
 
-        bool now_still = imu_still && flow_still;
+        State raw = raw_still ? State::STATIONARY
+                              : (raw_rot ? State::ROTATION_ONLY : State::MOVING);
 
-        if (now_still)
-        {
-            if (first_still_t_ < 0) first_still_t_ = last_t_;
-            is_still_ = (last_t_ - first_still_t_) >= hold_sec_;
+        if      (raw == State::STATIONARY)    { still_cnt_++;    rot_only_cnt_ = 0; move_cnt_ = 0; }
+        else if (raw == State::ROTATION_ONLY) { rot_only_cnt_++; still_cnt_    = 0; move_cnt_ = 0; }
+        else                                  { move_cnt_++;     still_cnt_    = 0; rot_only_cnt_ = 0; }
 
-            // Cache meanAcc the moment we confirm stationary — this is the
-            // most accurate gravity-in-body-frame measurement we will ever
-            // get, and it stays valid as a reference after the drone starts
-            // moving.
-            if (is_still_)
-            {
-                still_ref_acc_ = meanAcc();
-                have_still_ref_ = true;
-            }
-        }
-        else
+        if      (still_cnt_    >= confirm_cycles_) state_ = State::STATIONARY;
+        else if (rot_only_cnt_ >= confirm_cycles_) state_ = State::ROTATION_ONLY;
+        else if (move_cnt_     >= confirm_cycles_) state_ = State::MOVING;
+
+        if (state_ == State::STATIONARY)
         {
-            first_still_t_ = -1.0;
-            is_still_      = false;
+            still_ref_acc_ = meanAcc();
+            still_ref_gyr_ = meanGyr();
+            double s2 = 0.0;
+            for (const auto &e : imu_buf_)
+                s2 += (e.acc - still_ref_acc_).squaredNorm();
+            still_ref_acc_std_ = std::sqrt(s2 / double(std::max(1, (int)imu_buf_.size())));
+            have_still_ref_ = true;
         }
     }
 
-    std::deque<ImuSample> imu_buf_;
-    std::deque<std::pair<double,double>> flow_buf_;
+    std::deque<ImuSample>                imu_buf_;
+    std::deque<std::pair<double, double>> flow_buf_;
 
-    double first_still_t_;
-    bool   is_still_;
+    State state_;
+    int   still_cnt_, rot_only_cnt_, move_cnt_;
+
     double last_t_;
-    double last_flow_t_;
+    double acc_thr_      = 0.5;
+    double gyr_thr_      = 0.05;
+    double flow_thr_     = 2.0;
+    double window_sec_   = 0.5;
+    int    min_samples_  = 20;
+    double gravity_norm_ = 9.81;
+    int    confirm_cycles_ = 3;
 
-    // Sticky reference — last meanAcc while confirmed stationary.
-    bool   have_still_ref_;
+    double gyr_rot_min_   = 0.3;
+    double flow_ratio_    = 1.3;
+    double flow_baseline_ = 30.0;
+    double focal_         = 460.0;
+
+    bool            have_still_ref_;
     Eigen::Vector3d still_ref_acc_;
+    Eigen::Vector3d still_ref_gyr_;
+    double          still_ref_acc_std_;
 
-    double acc_thr_;
-    double gyr_thr_;
-    double flow_thr_;
-    double window_sec_;
-    double hold_sec_;
-    double gravity_norm_;
+    Eigen::Vector3d t_ic_ = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d R_ic_ = Eigen::Matrix3d::Identity();
+    bool have_lever_ = false;
+    bool have_R_ic_  = false;
 };
