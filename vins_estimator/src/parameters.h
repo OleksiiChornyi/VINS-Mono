@@ -38,72 +38,77 @@ extern int ESTIMATE_TD;
 extern int ROLLING_SHUTTER;
 extern double ROW, COL;
 
-// Hover-aware extensions. All values are optional in the YAML — the reader
-// supplies a sensible default when a key is missing. "hardcoded" thresholds
-// that the user asked to remove (0.5 m/s runaway, 25° rotation disagreement,
-// 8° gravity check, 3 m/s init cap, 150 frames reset, ZUPT weights) are now
-// derived from IMU noise characteristics (ACC_N / GYR_N) and the measured
-// image rate — they live as scaling coefficients rather than absolute values.
+// Hover-aware extensions.
+//
+// Design principle: the YAML holds only *calibrated* or *flight-intent*
+// values — camera/IMU intrinsics, extrinsics, td, and on/off switches for
+// fork-specific behaviors. Everything else (thresholds, scale factors,
+// physical envelopes) is either a compile-time constant or derived at
+// runtime from the calibrated values. This removes the "dozens of magic
+// YAML numbers" surface and keeps per-flight config minimal.
+//
+// YAML-driven (user switches):
+//   enable_zupt, enable_rotation_zupt, static_init_bias_priming,
+//   soften_failure_on_hover
+// Derived / constexpr: everything else.
+
 extern int    ENABLE_ZUPT;
+extern int    ENABLE_ROTATION_ZUPT;
+extern int    STATIC_INIT_BIAS_PRIMING;
+extern int    SOFTEN_FAILURE_ON_HOVER;
+
+// Stationarity thresholds — auto-derived from calibrated IMU noise on
+// startup so a fresh calibration flows through without touching any
+// thresholds manually. Users who need to override a specific platform
+// can set `static_acc_thr` / `static_gyr_thr` / `static_flow_thr` in
+// YAML; otherwise defaults are computed as 15 × {ACC_N, GYR_N}.
 extern double STATIC_ACC_THR;
 extern double STATIC_GYR_THR;
 extern double STATIC_FLOW_THR;
-extern double STATIC_WINDOW_SEC;
-extern int    STATIC_CONFIRM_CYCLES;       // hysteresis, evaluate()-cycles
-extern int    STATIC_INIT_BIAS_PRIMING;
-extern int    SOFTEN_FAILURE_ON_HOVER;
-extern int    ENABLE_ROTATION_ZUPT;
-extern double ROTATION_ZUPT_GYR_MIN;
-extern double ROTATION_ZUPT_FLOW_RATIO;
-extern double ROTATION_ZUPT_FLOW_BASELINE;
 
-// Adaptive scale factors (not absolute values) — user knobs with physical
-// meaning, default to 1.0:
-//   * GRAVITY_CHECK_SIGMA  scales the per-platform noise floor when turning
-//     the init gravity-disagreement threshold into degrees.
-//   * ROTATION_DISAGREE_SIGMA does the same for the IMU-vs-visual init
-//     rotation check.
-//   * INIT_MAX_VEL_COEF scales the IMU-derived plausibility cap for |V|
-//     after init (cap = coef · g · sum_dt — i.e. the max |V| attainable by
-//     integrating gravity over the window, a hard physical limit).
-//   * ZUPT_WEIGHT_SCALE biases the adaptive ZUPT weights toward stronger
-//     anchoring (>1) or softer hold (<1).
-//   * INIT_PARALLAX_PX is in normalized-FOCAL pixel units (VINS convention
-//     with FOCAL_LENGTH = 460); unchanged by image resolution.
-extern double GRAVITY_CHECK_SIGMA;
-extern double ROTATION_DISAGREE_SIGMA;
-extern double INIT_MAX_VEL_COEF;
-extern double ZUPT_WEIGHT_SCALE;
-extern double INIT_PARALLAX_PX;
+// Fork-wide universal constants — multirotor-agnostic, never needed per-
+// calibration. Defined as constexpr so there's one source of truth in the
+// repo. Want a different value? Edit this header and rebuild.
+namespace hover
+{
+// Rolling window & hysteresis.
+constexpr double STATIC_WINDOW_SEC      = 0.4;   // s, rolling window length
+constexpr int    STATIC_CONFIRM_CYCLES  = 3;     // cycles (~15 ms @200Hz)
 
-// Runaway detection — multiplier on IMU-consistent |V|. Default 4.0 means
-// "|V| is four-sigma above what IMU says we could be moving". No hardcoded
-// absolute velocity involved.
-extern double RUNAWAY_IMU_SIGMA;
+// Rotation-only classifier. Universal — depends on gyro physics + camera
+// geometry normalized through FOCAL_LENGTH, not on a particular platform.
+constexpr double ROTATION_ZUPT_GYR_MIN       = 0.3;   // rad/s   (~17 °/s)
+constexpr double ROTATION_ZUPT_FLOW_RATIO    = 1.3;
+constexpr double ROTATION_ZUPT_FLOW_BASELINE = 30.0;  // px/s
 
-// Safety-reset thresholds. `IDLE_RESET_SECONDS` is "how many seconds of
-// idle all_image_frame growth before we bail" — converted to frames using
-// the observed image rate (so image rate changes are handled correctly).
-extern double IDLE_RESET_SECONDS;
-extern int    IDLE_RESET_MAX_ATTEMPTS;
+// Adaptive-threshold sigma multipliers. Scale the derived noise floor by
+// this factor to get the reject threshold. Larger = looser, more tolerant.
+constexpr double GRAVITY_CHECK_SIGMA      = 6.0;
+constexpr double ROTATION_DISAGREE_SIGMA  = 8.0;
+constexpr double RUNAWAY_IMU_SIGMA        = 6.0;
+constexpr double INIT_MAX_VEL_COEF        = 1.5;
+constexpr double ZUPT_WEIGHT_SCALE        = 1.0;
 
-// Vision-pose bridge speed/accel limits. These come from the vehicle's
-// physics envelope, not from per-flight tuning — they can live in YAML:
-//   * VEHICLE_MAX_ACCEL  [m/s²]  — maximum plausible acceleration
-//   * VEHICLE_MAX_SPEED  [m/s]   — maximum plausible ground speed
-// The bridge uses the accel limit as a spike filter (warn but accept) and
-// the speed limit as the hard kick-out criterion (position truly diverged).
-extern double VEHICLE_MAX_ACCEL;
-extern double VEHICLE_MAX_SPEED;
+// Init parallax in normalized-FOCAL pixel units (VINS convention, 460).
+// Resolution-independent: feature_tracker normalizes features before
+// publishing, so a different camera resolution needs no change here.
+constexpr double INIT_PARALLAX_PX = 18.0;
 
-// Optional legacy YAML overrides. ≤0 → use the adaptive / derived value.
-// Exposed so existing per-platform YAMLs keep working without edits.
-extern double ZUPT_VEL_WEIGHT_OVERRIDE;
-extern double ZUPT_POS_WEIGHT_OVERRIDE;
-extern double ROTATION_ZUPT_POS_WEIGHT_OVERRIDE;
-extern double INIT_MAX_VELOCITY_OVERRIDE;
-extern double GRAVITY_CHECK_ANGLE_DEG_OVERRIDE;
-extern double RUNAWAY_V_ABS_OVERRIDE;
+// Safety reset — re-initialize the estimator when all_image_frame grows
+// due to low-parallax idle. The reset attempt count NEVER prevents the
+// system from continuing; after it's exceeded we switch to in-place
+// trimming and the estimator remains operational indefinitely. This
+// means a drone can sit stationary "forever" without needing a human
+// to restart the node.
+constexpr double IDLE_RESET_SECONDS      = 15.0;
+constexpr int    IDLE_RESET_MAX_ATTEMPTS = 5;
+
+// Vehicle physics envelope. Universal for multirotors — no credible
+// airframe exceeds these, so they serve as "state is diverged" kick-out
+// criteria, not per-flight tuning.
+constexpr double VEHICLE_MAX_ACCEL = 40.0;   // m/s² — ~4g, extreme maneuver
+constexpr double VEHICLE_MAX_SPEED = 30.0;   // m/s  — 108 km/h, racing drone
+}  // namespace hover
 
 
 void readParameters(ros::NodeHandle &n);
