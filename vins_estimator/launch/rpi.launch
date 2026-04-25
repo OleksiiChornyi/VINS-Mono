@@ -1,27 +1,18 @@
 <launch>
-    <!-- VINS-Mono launch for Raspberry Pi setup. Wraps the standard
-         feature_tracker + vins_estimator + pose_graph trio plus the
-         hover-aware vision_pose_bridge that forwards sanitized odometry
-         to /mavros/vision_pose/pose for ArduPilot.
+    <!-- VINS-Mono launch for Raspberry Pi setup. Same composition as the
+         user's original local rpi.launch (feature_tracker + vins_estimator
+         + pose_graph) plus the hover-aware vision_pose_bridge that
+         forwards sanitized odometry to /mavros/vision_pose/pose for
+         ArduPilot.
 
-         Config file is expected at config/rpi/rpi.yaml — the autostart
-         script copies it from the host (vins_docker/rpi.yaml) into the
-         container at startup so calibration survives docker rebuilds.
+         The rpi.yaml config is copied into config/rpi/ at startup by the
+         host autostart script (vins_docker/rpi.yaml → docker container).
 
-         Bridge ROS params (override at roslaunch time, e.g.
-         `roslaunch vins_estimator rpi.launch bridge_rate:=20`):
-           - bridge_rate         : publish Hz, default 10
-           - bridge_max_accel    : per-sample accel cap, default 40
-           - bridge_max_speed    : hard divergence cap,  default 30
-           - bridge_odom_timeout : seconds before DROPOUT, default 1.0
-           - bridge_imu_topic    : IMU topic for PRE_INIT yaw fallback.
-                                   /mavros/imu/data has orientation; if
-                                   that's empty in your setup, point this
-                                   to /mavros/imu/data_raw (no orientation
-                                   → bridge silently falls back to identity
-                                   in PRE_INIT).
-           - use_imu_yaw_in_pre_init : disable to publish identity quaternion
-                                       (matches pre-fork behavior).
+         vision_pose_bridge is launched here so the autostart script does
+         NOT need a separate `rosrun vision_pose_bridge` step. Bridge ROS
+         params are exposed as launch args:
+           bridge_rate, bridge_max_accel, bridge_max_speed,
+           bridge_odom_timeout
     -->
     <arg name="config_path" default="$(find feature_tracker)/../config/rpi/rpi.yaml" />
     <arg name="vins_path"   default="$(find feature_tracker)/../config/../" />
@@ -30,8 +21,6 @@
     <arg name="bridge_max_accel"     default="40.0" />
     <arg name="bridge_max_speed"     default="30.0" />
     <arg name="bridge_odom_timeout"  default="1.0" />
-    <arg name="bridge_imu_topic"     default="/mavros/imu/data_raw" />
-    <arg name="use_imu_yaw_in_pre_init" default="true" />
 
     <node name="feature_tracker" pkg="feature_tracker" type="feature_tracker" output="log">
         <param name="config_file" type="string" value="$(arg config_path)" />
@@ -39,16 +28,22 @@
     </node>
 
     <node name="vins_estimator" pkg="vins_estimator" type="vins_estimator" output="screen">
-       <param name="config_file" type="string" value="$(arg config_path)" />
-       <param name="vins_folder" type="string" value="$(arg vins_path)" />
+        <param name="config_file" type="string" value="$(arg config_path)" />
+        <param name="vins_folder" type="string" value="$(arg vins_path)" />
+    </node>
+
+    <node name="pose_graph" pkg="pose_graph" type="pose_graph" output="screen">
+        <param name="config_file" type="string" value="$(arg config_path)" />
+        <param name="visualization_shift_x" type="int" value="0" />
+        <param name="visualization_shift_y" type="int" value="0" />
+        <param name="skip_cnt" type="int" value="0" />
+        <param name="skip_dis" type="double" value="0" />
     </node>
 
     <node name="vision_pose_bridge" pkg="vins_estimator" type="vision_pose_bridge" output="screen">
-        <param name="rate"                    type="double" value="$(arg bridge_rate)" />
-        <param name="max_accel"               type="double" value="$(arg bridge_max_accel)" />
-        <param name="max_speed"               type="double" value="$(arg bridge_max_speed)" />
-        <param name="odom_timeout"            type="double" value="$(arg bridge_odom_timeout)" />
-        <param name="imu_topic"               type="string" value="$(arg bridge_imu_topic)" />
-        <param name="use_imu_yaw_in_pre_init" type="bool"   value="$(arg use_imu_yaw_in_pre_init)" />
+        <param name="rate"         type="double" value="$(arg bridge_rate)" />
+        <param name="max_accel"    type="double" value="$(arg bridge_max_accel)" />
+        <param name="max_speed"    type="double" value="$(arg bridge_max_speed)" />
+        <param name="odom_timeout" type="double" value="$(arg bridge_odom_timeout)" />
     </node>
 </launch>

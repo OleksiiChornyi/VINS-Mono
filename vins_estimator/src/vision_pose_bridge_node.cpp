@@ -1,7 +1,6 @@
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
-#include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
 #include <mavros_msgs/State.h>
 #include <deque>
@@ -10,8 +9,8 @@
 
 /*
  * VisionPoseBridge — forwards VINS-Mono odometry to ArduPilot via
- * /mavros/vision_pose/pose (optionally /mavros/vision_speed/twist) with
- * dual-mode sanity checking and recovery, and mirrors the sanitized pose
+ * /mavros/vision_pose/pose (and /mavros/vision_speed/twist) with
+ * dual-mode sanity checking and recovery, mirrors the sanitized pose
  * on /vins_bridge/pose for downstream consumers.
  *
  * States:
@@ -29,24 +28,24 @@
  *                  - VINS resumes (passes sanity) → ACTIVE
  *                  - Drone is disarmed → PRE_INIT
  *
- * Sanity check (3.3): combined velocity + acceleration test.
- *   Velocity  > vehicle_max_speed  → hard divergence, immediate DROPOUT.
- *   Accel     > vehicle_max_accel  → transient spike; increment counter.
- *   Violation counter uses a time window (5.2):
- *     - 2 consecutive → DROPOUT (preserves previous behavior)
- *     - 5 within 1 s  → DROPOUT (cumulative spike storm)
+ * Sanity check: combined velocity + acceleration test.
+ *   Velocity  > max_speed  → hard divergence, immediate DROPOUT.
+ *   Accel     > max_accel  → transient spike; increment counter.
+ *   Violation counter uses a time window:
+ *     - 2 consecutive → DROPOUT
+ *     - 5 within 1 s  → DROPOUT
  *     - otherwise decay after 2 s of clean samples.
  *
  * Published topics:
  *   /mavros/vision_pose/pose      — position + orientation for EKF3 pose
- *   /mavros/vision_speed/twist    — linear velocity for EKF3 (5.6)
+ *   /mavros/vision_speed/twist    — linear velocity for EKF3
  *   /vins_bridge/pose             — mirror (telemetry / debug)
  *
  * Parameters (ROS):
  *   ~odom_timeout  seconds without data before DROPOUT (default 1.0)
  *   ~rate          publish rate Hz (default 10.0)
- *   ~max_accel     per-sample acceleration warn cap  [m/s²] (default 30.0)
- *   ~max_speed     hard divergence speed cap         [m/s] (default 20.0)
+ *   ~max_accel     per-sample acceleration warn cap  [m/s²] (default 40.0)
+ *   ~max_speed     hard divergence speed cap         [m/s] (default 30.0)
  *   ~pose_frame    frame_id for the outgoing PoseStamped (default "odom")
  *   ~publish_speed publish /mavros/vision_speed/twist (default true)
  */
@@ -62,7 +61,6 @@ public:
         , last_odom_time_(0)
         , have_prev_pos_(false)
         , have_prev_vel_(false)
-        , have_imu_orient_(false)
     {
         ros::NodeHandle pnh("~");
         pnh.param("max_accel",    max_accel_,    40.0);
@@ -70,24 +68,6 @@ public:
         pnh.param("odom_timeout", odom_timeout_, 1.0);
         pnh.param<std::string>("pose_frame", pose_frame_, "odom");
         pnh.param("publish_speed", publish_speed_, true);
-        // Use IMU-provided orientation as the yaw fallback while the
-        // estimator is in PRE_INIT. ArduPilot EKF3 complains about a
-        // "compass problem" when we publish identity quaternion because
-        // it expects roll/pitch/yaw from the vision source even before
-        // position is valid. Feeding back the IMU's own orientation
-        // (which EKF3 already knows via INS) gives it a consistent view
-        // and silences the warning. Set ~use_imu_yaw_in_pre_init=false
-        // to fall back to identity if this interferes with anything.
-        pnh.param("use_imu_yaw_in_pre_init", use_imu_yaw_, true);
-        // Default to data_raw because that's what most ArduPilot-fed MAVROS
-        // setups have publishing reliably. data_raw has no orientation, so
-        // the bridge will silently fall back to identity quaternion in
-        // PRE_INIT (same as pre-fork behavior). To actually enable the
-        // yaw-fallback fix for the EKF "bad compass" warning, point this
-        // param to /mavros/imu/data which carries fused orientation from
-        // ArduPilot's INS — make sure ATTITUDE stream rate is non-zero on
-        // the FCU side first.
-        pnh.param<std::string>("imu_topic", imu_topic_, "/mavros/imu/data_raw");
         double rate;
         pnh.param("rate", rate, 10.0);
 
@@ -101,10 +81,6 @@ public:
         sub_odom_ = nh_.subscribe(
             "/vins_estimator/odometry", 10,
             &VisionPoseBridge::odomCallback, this);
-        if (use_imu_yaw_)
-            sub_imu_ = nh_.subscribe(
-                imu_topic_, 50,
-                &VisionPoseBridge::imuCallback, this);
         sub_state_ = nh_.subscribe(
             "/mavros/state", 5,
             &VisionPoseBridge::stateCallback, this);
@@ -113,9 +89,8 @@ public:
             ros::Duration(1.0 / rate),
             &VisionPoseBridge::timerCallback, this);
 
-        ROS_INFO("vision_pose_bridge: rate=%.0fHz frame=%s speed=%s imu_yaw=%s",
-                 rate, pose_frame_.c_str(), publish_speed_ ? "on" : "off",
-                 use_imu_yaw_ ? imu_topic_.c_str() : "off");
+        ROS_INFO("vision_pose_bridge: rate=%.0fHz frame=%s speed=%s",
+                 rate, pose_frame_.c_str(), publish_speed_ ? "on" : "off");
         ROS_INFO("  max_accel=%.1f m/s² max_speed=%.1f m/s timeout=%.1fs",
                  max_accel_, max_speed_, odom_timeout_);
     }
@@ -297,26 +272,6 @@ private:
         is_armed_ = msg->armed;
     }
 
-    // IMU orientation feed (5.5 fix). ArduPilot publishes its INS-fused
-    // orientation on /mavros/imu/data — we cache it and play it back into
-    // /mavros/vision_pose/pose during PRE_INIT so EKF3 does not see the
-    // vision source disagree with its own INS estimate (which manifests
-    // as a spurious "bad compass" warning on a compass-less setup).
-    //
-    // Once the estimator reaches ACTIVE, VINS orientation supersedes this
-    // feed — the IMU cache is no longer consulted.
-    void imuCallback(const sensor_msgs::Imu::ConstPtr &msg)
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        imu_orient_ = msg->orientation;
-        // sensor_msgs/Imu allows orientation_covariance[0] = -1 to signal
-        // "orientation not provided". In that case we fall back to
-        // identity (same as having use_imu_yaw disabled).
-        have_imu_orient_ = !(msg->orientation_covariance[0] < 0) &&
-                           !(msg->orientation.x == 0 && msg->orientation.y == 0 &&
-                             msg->orientation.z == 0 && msg->orientation.w == 0);
-    }
-
     // ── Timer (publishes at fixed rate) ────────────────────────────
     void timerCallback(const ros::TimerEvent &)
     {
@@ -374,19 +329,10 @@ private:
                 pose_out.pose.position.x = 0;
                 pose_out.pose.position.y = 0;
                 pose_out.pose.position.z = 0;
-                // Use IMU-provided orientation if available, else identity.
-                // See imuCallback comment for rationale.
-                if (use_imu_yaw_ && have_imu_orient_)
-                {
-                    pose_out.pose.orientation = imu_orient_;
-                }
-                else
-                {
-                    pose_out.pose.orientation.x = 0;
-                    pose_out.pose.orientation.y = 0;
-                    pose_out.pose.orientation.z = 0;
-                    pose_out.pose.orientation.w = 1;
-                }
+                pose_out.pose.orientation.x = 0;
+                pose_out.pose.orientation.y = 0;
+                pose_out.pose.orientation.z = 0;
+                pose_out.pose.orientation.w = 1;
             }
         }
 
@@ -404,7 +350,6 @@ private:
     ros::Publisher  pub_speed_;
     ros::Subscriber sub_odom_;
     ros::Subscriber sub_state_;
-    ros::Subscriber sub_imu_;
     ros::Timer      timer_;
     std::mutex      mtx_;
 
@@ -417,8 +362,6 @@ private:
     double odom_timeout_;
     std::string pose_frame_;
     bool   publish_speed_;
-    bool   use_imu_yaw_;
-    std::string imu_topic_;
 
     geometry_msgs::Point prev_pos_;
     double prev_stamp_;
@@ -426,16 +369,12 @@ private:
     double prev_vx_, prev_vy_, prev_vz_;
     double prev_dt_;
     bool   have_prev_vel_;
-    // Timestamps of recent accel violations for windowed escalation (5.2).
+    // Timestamps of recent accel violations for windowed escalation.
     std::deque<double> viol_times_;
 
     geometry_msgs::PoseStamped  last_pose_;
     geometry_msgs::TwistStamped last_twist_;
     bool have_last_twist_ = false;
-
-    // Cached IMU-provided orientation for PRE_INIT yaw fallback.
-    geometry_msgs::Quaternion imu_orient_;
-    bool have_imu_orient_;
 };
 
 int main(int argc, char **argv)
