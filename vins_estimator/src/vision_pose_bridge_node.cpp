@@ -79,7 +79,15 @@ public:
         // and silences the warning. Set ~use_imu_yaw_in_pre_init=false
         // to fall back to identity if this interferes with anything.
         pnh.param("use_imu_yaw_in_pre_init", use_imu_yaw_, true);
-        pnh.param<std::string>("imu_topic", imu_topic_, "/mavros/imu/data");
+        // Default to data_raw because that's what most ArduPilot-fed MAVROS
+        // setups have publishing reliably. data_raw has no orientation, so
+        // the bridge will silently fall back to identity quaternion in
+        // PRE_INIT (same as pre-fork behavior). To actually enable the
+        // yaw-fallback fix for the EKF "bad compass" warning, point this
+        // param to /mavros/imu/data which carries fused orientation from
+        // ArduPilot's INS — make sure ATTITUDE stream rate is non-zero on
+        // the FCU side first.
+        pnh.param<std::string>("imu_topic", imu_topic_, "/mavros/imu/data_raw");
         double rate;
         pnh.param("rate", rate, 10.0);
 
