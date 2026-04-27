@@ -177,4 +177,29 @@ class Estimator
     // Last observed rotation disagreement between IMU and visual alignment,
     // kept as a post-init diagnostic; logged by the optimizer.
     double last_init_disagree_deg;
+
+    // Confidence-based fade from "fork hover-aware" mode toward stock
+    // VINS-Mono behavior (user feedback: hovers ~1 m wider than vanilla
+    // VINS-Mono after the fork's changes — the ZUPT and softened failure
+    // detection actually fight stable in-flight tracking once the state
+    // is well-conditioned).
+    //
+    // post_init_clean_cycles counts consecutive successful optimization()
+    // cycles (frame committed, failureDetection passed). Reset to 0 by
+    // any failure or by initialStructure(). Used by:
+    //   * optimization()      — ZUPT weight scales by exp-fade past 50 cycles
+    //   * failureDetection()  — soften only active for first ~100 cycles
+    //
+    // At 10 Hz image rate: 50 cycles ≈ 5 s (full fork strength), 200 cycles
+    // ≈ 20 s (fully stock VINS-Mono behavior).
+    int post_init_clean_cycles;
+
+    // Initialization attempt counter. visualInitialAlign skips the extra
+    // hover-aware sanity checks (gravity-direction disagreement, IMU/visual
+    // rotation disagreement) on the first 2 attempts so a marginal scene
+    // can still init quickly. Only after 2 failures does it engage the
+    // additional checks — which catch genuinely-bad alignments but
+    // occasionally reject borderline-valid ones, contributing to "1 in 10
+    // takeoffs init slow" reports.
+    int init_attempt_count;
 };
