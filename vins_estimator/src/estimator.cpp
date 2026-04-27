@@ -8,6 +8,8 @@ Estimator::Estimator(): f_manager{Rs}
     last_safety_reset_t = -1.0;
     image_rate_hz = 10.0;  // replaced by measurement after a few frames
     last_init_disagree_deg = 0.0;
+    post_init_clean_cycles = 0;
+    init_attempt_count = 0;
     for (int i = 0; i < WINDOW_SIZE + 1; i++) was_stationary[i] = false;
     clearState();
 }
@@ -111,6 +113,12 @@ void Estimator::clearState()
     last_imu_t = -1.0;
     for (int i = 0; i < WINDOW_SIZE + 1; i++) was_stationary[i] = false;
     last_init_disagree_deg = 0.0;
+    // post_init_clean_cycles resets so the next init starts at full fork
+    // strength (ZUPT/soften both fully active), then fades again.
+    post_init_clean_cycles = 0;
+    // init_attempt_count INTENTIONALLY not reset — it's a per-session
+    // counter, so a reboot mid-flight doesn't re-engage liberal init
+    // checks that we already know are not enough for this scene.
     // init_safety_reset_count and last_safety_reset_t are NOT reset here —
     // they escalate across reset attempts to widen tolerance. A fresh counter
     // lives in the Estimator ctor / setParameter().
@@ -376,6 +384,13 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             return;
         }
 
+        // Confidence accumulator — every successful optimization+failureDetection
+        // cycle increments this. Past ~50 cycles (~5 s @ 10 Hz) the fork's
+        // hover-aware additions start fading toward stock VINS-Mono behavior;
+        // past ~200 cycles (~20 s) they're fully off. See comments in
+        // optimization() and failureDetection().
+        post_init_clean_cycles++;
+
         TicToc t_margin;
         slideWindow();
         f_manager.removeFailures();
@@ -562,6 +577,21 @@ bool Estimator::initialStructure()
 
 bool Estimator::visualInitialAlign()
 {
+    init_attempt_count++;
+    // First 2 init attempts skip the fork's extra sanity checks (gravity-
+    // direction disagreement, IMU/visual rotation disagreement, |V| cap)
+    // so a marginal scene can still init quickly. The stock VisualIMUAlignment
+    // gravity-norm check below is always honored. Only after 2 failures do
+    // the strict checks engage to catch genuinely-bad alignments.
+    //
+    // Rationale: the strict checks correctly reject ~5% of edge-case inits,
+    // but in normal flight they sometimes (~10% of takeoffs) reject a
+    // borderline-valid one — which then causes the user-visible "1 in 10
+    // takeoffs init slow → drone drifts → EKF gives up" failure mode. The
+    // staged-strictness keeps fast init in the common case while still
+    // catching pathological alignments that re-occur across attempts.
+    const bool strict_checks = init_attempt_count > 2;
+
     TicToc t_g;
     VectorXd x;
     //solve scale
@@ -664,7 +694,7 @@ bool Estimator::visualInitialAlign()
     // We additionally reject cached-reference mode if ROTATION_ONLY has
     // been observed since the cache was taken, via a fresh timestamp
     // comparison maintained below.
-    if (STATIC_INIT_BIAS_PRIMING && motion_detector.imuCount() >= 20)
+    if (strict_checks && STATIC_INIT_BIAS_PRIMING && motion_detector.imuCount() >= 20)
     {
         const bool use_live = motion_detector.isStationary();
         const bool use_cached = !use_live && motion_detector.hasStationaryReference()
@@ -719,16 +749,11 @@ bool Estimator::visualInitialAlign()
         // check below + failureDetection runaway guard do the job.
     }
 
-    // Post-init velocity plausibility — fully physics-based, zero hardcode
-    // (3.3, 4). A "bad alignment" is one whose predicted |V| exceeds what
-    // IMU could have integrated from a standstill within the window period.
-    // IMU acceleration integrates as: v_max_imu = 0.5 * acc_peak * window,
-    // bounded above by 2 * g (the absolute dynamical limit for a thrust-
-    // weight ratio of ~2). We multiply by INIT_MAX_VEL_COEF (safety margin,
-    // default 1.5) and cap at the configured vehicle envelope.
-    //
-    // This ties the threshold to the *physics of the IMU data itself*,
-    // not to a one-off YAML number.
+    // Post-init velocity plausibility — fully physics-based.
+    // Bad alignment = predicted |V| exceeds what IMU could have integrated
+    // from standstill within the window period: v_max = max(peak_a, 2g) *
+    // window/2 * INIT_MAX_VEL_COEF.
+    if (strict_checks)
     {
         double window_dt = 0.0;
         double peak_acc = 0.0;
@@ -757,19 +782,11 @@ bool Estimator::visualInitialAlign()
         }
     }
 
-    // IMU-vs-visual rotation consistency check. Adaptive threshold from
-    // gyro noise model, not hardcoded 25°. The ±1σ gyro-integration error
-    // over the window is:  σ_φ ≈ GYR_N * sqrt(sum_dt)  (random walk from
-    // white noise), plus a bias-walk term  GYR_W * sum_dt^1.5  negligible
-    // for short windows. We threshold at ROTATION_DISAGREE_SIGMA × σ_φ,
-    // floored at 10° (SFM noise floor) and capped at 40° (anything past
-    // that is obviously a twist/flip regardless of noise).
-    //
-    // 3.4: legitimate fast takeoffs produce large body rotations, but IMU
-    // and visual SHOULD both reflect that rotation equally — the check
-    // compares IMU-accumulated to SfM-accumulated, both of which include
-    // the legitimate rotation. The only way they disagree is if SfM's
-    // pose ambiguity gave the wrong solution.
+    // IMU-vs-visual rotation consistency check. Catches the rare 5-point-
+    // pose mirror/twist failure where SfM "succeeds" with a flipped solution.
+    // Threshold = ROTATION_DISAGREE_SIGMA × σ_φ where σ_φ = GYR_N · √sum_dt
+    // (gyro random walk over window), floored 10°, capped 40°.
+    if (strict_checks)
     {
         Eigen::Quaterniond q_imu = Eigen::Quaterniond::Identity();
         double sum_dt = 0.0;
@@ -1008,24 +1025,25 @@ void Estimator::double2vector()
 
 bool Estimator::failureDetection()
 {
-    const bool hover_soften = SOFTEN_FAILURE_ON_HOVER && motion_detector.isStationary();
+    // Hover-aware soften only active during the bootstrap window (~10 s
+    // post-init). Past that, fully trust the stock VINS-Mono failure
+    // criteria — they are tighter and match the user's expected hover
+    // stability of the original algorithm.
+    const bool in_bootstrap = post_init_clean_cycles < 100;
+    const bool hover_soften = in_bootstrap && SOFTEN_FAILURE_ON_HOVER &&
+                              motion_detector.isStationary();
 
-    // Runaway guard — fully data-driven (4). Instead of "|V| > 0.5 m/s", we
-    // compare |V| against what the IMU itself says could be happening:
+    // Runaway guard — only during bootstrap window. Past that, the stock
+    // big-translation / big-z-translation / big-bias checks below already
+    // catch real divergence; the IMU-sigma runaway here is a belt-and-
+    // braces safety net for the fragile post-init state.
     //
     //   σ_v_imu = ACC_N * sqrt(sum_dt)    — 1σ velocity error from noise
     //   v_threshold = hover::RUNAWAY_IMU_SIGMA * σ_v_imu    (default 6σ)
     //
-    // At 1 s window, ACC_N=0.04 → σ=0.04 m/s → 6σ = 0.24 m/s. If the drone
-    // is truly stationary (motion_detector confirmed) and |V| exceeds this,
-    // state is diverged — threshold scales with the IMU's calibrated noise
-    // floor, not a platform knob.
-    //
-    // A hard floor at ~10 cm/s catches divergence on cleanly-calibrated
-    // IMUs whose 6σ might otherwise fall below the numerical noise of the
-    // optimization (we've seen this where 6σ ≈ 4 cm/s, inside Ceres
-    // convergence tolerance, leading to false positives from tiny wobble).
-    if (motion_detector.isStationary())
+    // Floor 10 cm/s prevents false positives from tiny wobble on a
+    // suspiciously clean IMU calibration.
+    if (in_bootstrap && motion_detector.isStationary())
     {
         double sum_dt = 0.0;
         for (int i = 1; i <= WINDOW_SIZE; i++)
@@ -1147,32 +1165,46 @@ void Estimator::optimization()
         problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
     }
 
-    // Zero-Velocity Update — hover-aware fork (2.1, 2.2, 2.3, 2.4).
+    // Zero-Velocity Update — hover-aware fork.
     //
     // Adaptive weights: 1/σ where σ is the expected pseudo-measurement
-    // noise given the IMU noise floor and the window's frame period. For
-    // genuine stationary IMU integration noise:
+    // noise given the IMU noise floor and the window's frame period:
     //   σ_vel ≈ ACC_N · sqrt(dt_frame)
     //   σ_pos ≈ ACC_N · dt_frame^{1.5} / sqrt(3)
-    // Weights = hover::ZUPT_WEIGHT_SCALE / σ. No YAML knobs.
+    // Weights = hover::ZUPT_WEIGHT_SCALE / σ.
     //
-    // Per-frame gating (2.2): ZUPT only fires for frames whose
-    // was_stationary[] flag was set at capture — prevents pinning frames
-    // that were actually moving but happen to be in the current window.
+    // Per-frame gating: ZUPT only fires for frames whose was_stationary[]
+    // flag was set at capture — prevents pinning frames that were actually
+    // moving but happen to be in the window.
     //
-    // Equal weight on X/Y/Z (2.3): the hover-aware goal is "drone holds
-    // its VIO position against wind" — we WANT ZUPT to clamp XY equally
-    // to Z. Anything less causes the symptom the user observed ("sometimes
-    // thinks it's drifting when standing still"). The flight controller's
-    // position-hold loop then does the work of physically counteracting
-    // wind with tilt thrust; VIO gives it a stable setpoint to hold to.
+    // Equal weight on X/Y/Z: the goal is "drone holds its VIO position
+    // against wind" — the flight controller does the wind-compensation
+    // work, VIO gives it a stable setpoint.
+    //
+    // Confidence fade: hover-aware ZUPT gives a fast, stable bootstrap but
+    // can fight in-flight optimizer convergence once the state is well-
+    // conditioned (user-visible: ~1 m hover circle vs vanilla VINS-Mono's
+    // tighter hold). We linearly fade the ZUPT contribution from full at
+    // post_init_clean_cycles=50 to zero at 200, transitioning the system
+    // from "fork bootstrap mode" to "stock VINS-Mono mode" once the
+    // optimizer has had time to find a good linearization point.
+    const int FADE_START  = 50;   // cycles — start fading
+    const int FADE_END    = 200;  // cycles — fully stock VINS-Mono
+    double fade = 1.0;
+    if (post_init_clean_cycles > FADE_START)
+    {
+        if (post_init_clean_cycles >= FADE_END) fade = 0.0;
+        else fade = 1.0 - double(post_init_clean_cycles - FADE_START) /
+                          double(FADE_END - FADE_START);
+    }
+
     const double dt_frame = 1.0 / std::max(image_rate_hz, 1.0);
     const double sigma_v_zupt = ACC_N * std::sqrt(dt_frame);
     const double sigma_p_zupt = ACC_N * dt_frame * std::sqrt(dt_frame) / std::sqrt(3.0);
-    const double w_vel = hover::ZUPT_WEIGHT_SCALE / std::max(sigma_v_zupt, 1e-4);
-    const double w_pos = hover::ZUPT_WEIGHT_SCALE / std::max(sigma_p_zupt, 1e-5);
+    const double w_vel = fade * hover::ZUPT_WEIGHT_SCALE / std::max(sigma_v_zupt, 1e-4);
+    const double w_pos = fade * hover::ZUPT_WEIGHT_SCALE / std::max(sigma_p_zupt, 1e-5);
 
-    if (ENABLE_ZUPT && motion_detector.isStationary())
+    if (fade > 0.01 && ENABLE_ZUPT && motion_detector.isStationary())
     {
         int zupt_frames = 0;
         for (int j = std::max(0, WINDOW_SIZE - 3); j <= WINDOW_SIZE; j++)
@@ -1189,17 +1221,14 @@ void Estimator::optimization()
             problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[i + 1]);
         }
         if (zupt_frames > 0)
-            ROS_DEBUG("hover ZUPT: frames=%d w_vel=%.1f w_pos=%.1f",
-                      zupt_frames, w_vel, w_pos);
+            ROS_DEBUG("hover ZUPT: frames=%d w_vel=%.1f w_pos=%.1f fade=%.2f",
+                      zupt_frames, w_vel, w_pos, fade);
     }
-    // Rotation-only ZUPT — position anchor during pure rotation.
-    //
-    // Classifier is already configured internally; no args at call site.
-    // Weight is halved relative to stationary position weight because during
-    // rotation the residual translation is genuinely nonzero (lever-arm
-    // effect at the camera), so we don't want a hard clamp — just enough
-    // to prevent extrinsic-leak drift.
-    else if (ENABLE_ROTATION_ZUPT && motion_detector.isRotationOnly())
+    // Rotation-only ZUPT — position anchor during pure rotation. Weight is
+    // halved relative to stationary position weight because during rotation
+    // the residual translation is genuinely nonzero (lever-arm at the
+    // camera), so we don't want a hard clamp.
+    else if (fade > 0.01 && ENABLE_ROTATION_ZUPT && motion_detector.isRotationOnly())
     {
         const double w_pos_rot = w_pos * 0.5;
         for (int i = std::max(0, WINDOW_SIZE - 2); i < WINDOW_SIZE; i++)
@@ -1207,8 +1236,9 @@ void Estimator::optimization()
             auto *zp = new ZUPTPositionFactor(w_pos_rot);
             problem.AddResidualBlock(zp, NULL, para_Pose[i], para_Pose[i + 1]);
         }
-        ROS_DEBUG("rotation ZUPT: |gyr|=%.2f flow=%.1f w_pos=%.1f",
-                  motion_detector.meanGyrMagnitude(), motion_detector.meanFlow(), w_pos_rot);
+        ROS_DEBUG("rotation ZUPT: |gyr|=%.2f flow=%.1f w_pos=%.1f fade=%.2f",
+                  motion_detector.meanGyrMagnitude(), motion_detector.meanFlow(),
+                  w_pos_rot, fade);
     }
 
     int f_m_cnt = 0;
