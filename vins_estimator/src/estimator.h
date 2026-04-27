@@ -193,13 +193,4 @@ class Estimator
     // At 10 Hz image rate: 50 cycles ≈ 5 s (full fork strength), 200 cycles
     // ≈ 20 s (fully stock VINS-Mono behavior).
     int post_init_clean_cycles;
-
-    // Initialization attempt counter. visualInitialAlign skips the extra
-    // hover-aware sanity checks (gravity-direction disagreement, IMU/visual
-    // rotation disagreement) on the first 2 attempts so a marginal scene
-    // can still init quickly. Only after 2 failures does it engage the
-    // additional checks — which catch genuinely-bad alignments but
-    // occasionally reject borderline-valid ones, contributing to "1 in 10
-    // takeoffs init slow" reports.
-    int init_attempt_count;
 };
