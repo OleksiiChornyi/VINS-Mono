@@ -92,7 +92,15 @@ constexpr double ZUPT_WEIGHT_SCALE        = 1.0;
 // Init parallax in normalized-FOCAL pixel units (VINS convention, 460).
 // Resolution-independent: feature_tracker normalizes features before
 // publishing, so a different camera resolution needs no change here.
-constexpr double INIT_PARALLAX_PX = 18.0;
+//
+// Lowered from the fork's previous 18 px to 10 px to match stock VINS-Mono.
+// The fork-specific tightening was unhelpful: it made the dynamic-init path
+// reject borderline-valid solutions in marginal scenes (drone moving slowly
+// at takeoff). Static bootstrap now handles the stationary case, so the
+// dynamic path can be as permissive as upstream — the strict checks in
+// visualInitialAlign (gravity, |V|, rotation disagreement) catch the
+// genuinely-bad alignments that low parallax might let through.
+constexpr double INIT_PARALLAX_PX = 10.0;
 
 // Safety reset — re-initialize the estimator when all_image_frame grows
 // due to low-parallax idle. The reset attempt count NEVER prevents the

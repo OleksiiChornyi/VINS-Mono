@@ -52,6 +52,13 @@ class Estimator
     // internal
     void clearState();
     bool initialStructure();
+    // Static IMU bootstrap. When MotionDetector confirms the drone is at
+    // rest (typical pre-takeoff state), this skips SfM entirely and seeds
+    // estimator state directly from the IMU gravity vector + gyro bias.
+    // Returns true if state was populated and solver_flag should advance
+    // to NON_LINEAR. Falls back to false if not stationary or IMU sample
+    // count is too low — the regular SfM-based path then runs.
+    bool tryStaticBootstrap();
     bool visualInitialAlign();
     bool relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l);
     void slideWindow();
