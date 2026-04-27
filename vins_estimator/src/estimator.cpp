@@ -9,7 +9,6 @@ Estimator::Estimator(): f_manager{Rs}
     image_rate_hz = 10.0;  // replaced by measurement after a few frames
     last_init_disagree_deg = 0.0;
     post_init_clean_cycles = 0;
-    init_attempt_count = 0;
     for (int i = 0; i < WINDOW_SIZE + 1; i++) was_stationary[i] = false;
     clearState();
 }
@@ -116,9 +115,6 @@ void Estimator::clearState()
     // post_init_clean_cycles resets so the next init starts at full fork
     // strength (ZUPT/soften both fully active), then fades again.
     post_init_clean_cycles = 0;
-    // init_attempt_count INTENTIONALLY not reset — it's a per-session
-    // counter, so a reboot mid-flight doesn't re-engage liberal init
-    // checks that we already know are not enough for this scene.
     // init_safety_reset_count and last_safety_reset_t are NOT reset here —
     // they escalate across reset attempts to widen tolerance. A fresh counter
     // lives in the Estimator ctor / setParameter().
@@ -577,20 +573,15 @@ bool Estimator::initialStructure()
 
 bool Estimator::visualInitialAlign()
 {
-    init_attempt_count++;
-    // First 2 init attempts skip the fork's extra sanity checks (gravity-
-    // direction disagreement, IMU/visual rotation disagreement, |V| cap)
-    // so a marginal scene can still init quickly. The stock VisualIMUAlignment
-    // gravity-norm check below is always honored. Only after 2 failures do
-    // the strict checks engage to catch genuinely-bad alignments.
-    //
-    // Rationale: the strict checks correctly reject ~5% of edge-case inits,
-    // but in normal flight they sometimes (~10% of takeoffs) reject a
-    // borderline-valid one — which then causes the user-visible "1 in 10
-    // takeoffs init slow → drone drifts → EKF gives up" failure mode. The
-    // staged-strictness keeps fast init in the common case while still
-    // catching pathological alignments that re-occur across attempts.
-    const bool strict_checks = init_attempt_count > 2;
+    // The fork's extra sanity checks below (gravity-direction disagreement,
+    // IMU/visual rotation disagreement, physics-derived |V| cap) run on every
+    // init attempt. They're sigma-derived with generous clamps (3-20° for
+    // gravity, 10-40° for rotation, |V|≤max(peak_a,2g)*window/2*1.5) so they
+    // reject genuinely-bad alignments without rejecting honest borderline
+    // ones. Skipping them on early attempts was a fragile heuristic — fork
+    // can be restarted multiple times per flight (land → takeoff → land
+    // without disarm), making "first N attempts" not a reliable proxy for
+    // "scene difficulty".
 
     TicToc t_g;
     VectorXd x;
@@ -694,7 +685,7 @@ bool Estimator::visualInitialAlign()
     // We additionally reject cached-reference mode if ROTATION_ONLY has
     // been observed since the cache was taken, via a fresh timestamp
     // comparison maintained below.
-    if (strict_checks && STATIC_INIT_BIAS_PRIMING && motion_detector.imuCount() >= 20)
+    if (STATIC_INIT_BIAS_PRIMING && motion_detector.imuCount() >= 20)
     {
         const bool use_live = motion_detector.isStationary();
         const bool use_cached = !use_live && motion_detector.hasStationaryReference()
@@ -753,7 +744,6 @@ bool Estimator::visualInitialAlign()
     // Bad alignment = predicted |V| exceeds what IMU could have integrated
     // from standstill within the window period: v_max = max(peak_a, 2g) *
     // window/2 * INIT_MAX_VEL_COEF.
-    if (strict_checks)
     {
         double window_dt = 0.0;
         double peak_acc = 0.0;
@@ -786,7 +776,6 @@ bool Estimator::visualInitialAlign()
     // pose mirror/twist failure where SfM "succeeds" with a flipped solution.
     // Threshold = ROTATION_DISAGREE_SIGMA × σ_φ where σ_φ = GYR_N · √sum_dt
     // (gyro random walk over window), floored 10°, capped 40°.
-    if (strict_checks)
     {
         Eigen::Quaterniond q_imu = Eigen::Quaterniond::Identity();
         double sum_dt = 0.0;
