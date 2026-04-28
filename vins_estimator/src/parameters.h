@@ -94,12 +94,11 @@ constexpr double ZUPT_WEIGHT_SCALE        = 1.0;
 // publishing, so a different camera resolution needs no change here.
 //
 // Lowered from the fork's previous 18 px to 10 px to match stock VINS-Mono.
-// The fork-specific tightening was unhelpful: it made the dynamic-init path
-// reject borderline-valid solutions in marginal scenes (drone moving slowly
-// at takeoff). Static bootstrap now handles the stationary case, so the
-// dynamic path can be as permissive as upstream — the strict checks in
-// visualInitialAlign (gravity, |V|, rotation disagreement) catch the
-// genuinely-bad alignments that low parallax might let through.
+// Lower threshold = init succeeds with less motion, so the drone needs to
+// move only a small amount at takeoff for the SfM-based init to find
+// enough parallax. The strict checks downstream in visualInitialAlign
+// (gravity / |V| / rotation disagreement) still catch the few low-parallax
+// alignments that would actually be wrong.
 constexpr double INIT_PARALLAX_PX = 10.0;
 
 // Safety reset — re-initialize the estimator when all_image_frame grows
