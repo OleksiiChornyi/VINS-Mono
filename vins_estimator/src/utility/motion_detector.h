@@ -65,8 +65,8 @@ public:
     // Lever arm from IMU origin to camera origin (imu^T_cam). Used to
     // include the rotation-induced translation at the camera in the
     // rotation-only classifier; matches VINS-Mono's TIC[0] convention.
-    void setLeverArm(const Eigen::Vector3d &t_ic) { t_ic_ = t_ic; have_lever_ = true; }
-    void setExtrinsicR(const Eigen::Matrix3d &R_ic) { R_ic_ = R_ic; have_R_ic_ = true; }
+    void setLeverArm(const Eigen::Vector3d &t_ic) { t_ic_ = t_ic; }
+    void setExtrinsicR(const Eigen::Matrix3d &R_ic) { R_ic_ = R_ic; }
     void setFocalLength(double f) { focal_ = f; }
 
     // Clears transient state only; preserves configured thresholds so a
@@ -313,6 +313,4 @@ private:
 
     Eigen::Vector3d t_ic_ = Eigen::Vector3d::Zero();
     Eigen::Matrix3d R_ic_ = Eigen::Matrix3d::Identity();
-    bool have_lever_ = false;
-    bool have_R_ic_  = false;
 };

@@ -39,13 +39,7 @@ class Estimator
     // MotionDetector on the same timebase as image pushes, so the rolling
     // window is coherent even when online-td offsets or auto-reset events
     // shift the estimator's internal clocks.
-    //
-    // The legacy 3-argument overload (dt only) is kept for any external user
-    // of this class; it synthesises `t` from an internal accumulator — works
-    // for most cases but is susceptible to reset-caused timing glitches, so
-    // prefer the 4-argument form.
     void processIMU(double dt, double t, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-    void processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
     void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header);
     void setReloFrame(double _frame_stamp, int _frame_index, vector<Vector3d> &_match_points, Vector3d _relo_t, Matrix3d _relo_r);
 
@@ -154,9 +148,7 @@ class Estimator
     // Hover-aware state: stationarity detector driving ZUPT, static init
     // priming, and softened failure detection.
     MotionDetector motion_detector;
-    double last_image_t;
-    double imu_clock;          // fallback monotonic clock (legacy path)
-    double last_imu_t;         // absolute ROS timestamp of latest IMU sample
+    double last_image_t;       // absolute ROS timestamp of latest image push
 
     // Per-frame stationary flag in the window. Set when processImage commits
     // a frame while MotionDetector reports STATIONARY; allows ZUPT to fire
@@ -173,10 +165,6 @@ class Estimator
     // Image rate, used for scaling time-dependent thresholds (e.g. the
     // all_image_frame overflow cap). Measured from consecutive image pushes.
     double image_rate_hz;
-
-    // Last observed rotation disagreement between IMU and visual alignment,
-    // kept as a post-init diagnostic; logged by the optimizer.
-    double last_init_disagree_deg;
 
     // Confidence-based fade from "fork hover-aware" mode toward stock
     // VINS-Mono behavior (user feedback: hovers ~1 m wider than vanilla
