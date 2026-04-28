@@ -6,7 +6,6 @@
 #include <deque>
 #include <mutex>
 #include <cmath>
-#include <eigen3/Eigen/Geometry>
 
 /*
  * VisionPoseBridge — forwards VINS-Mono odometry to ArduPilot via
@@ -18,23 +17,16 @@
  *   PRE_INIT  →  Publishes (0,0,0) + identity orientation at ~rate Hz.
  *                Allows arm in PosHold.
  *                Transition: VINS odometry arrives (passes sanity) → ACTIVE
- *                On entry into ACTIVE we capture an anchor (first VINS pose)
- *                and re-express every subsequent pose relative to it. The
- *                EKF therefore sees the drone "take off at (0,0,0) facing
- *                forward" regardless of where VINS-Mono internally placed
- *                its world origin — eliminates the position/yaw step at
- *                hand-off that would otherwise trip ArduPilot EKF3 trust.
  *
- *   ACTIVE    →  Forwards VINS position + orientation, anchor-corrected.
+ *   ACTIVE    →  Forwards VINS position + orientation.
  *                Transitions:
  *                  - VINS data stale > odom_timeout → DROPOUT
  *                  - Sanity check fails → DROPOUT
  *
  *   DROPOUT   →  Stops publishing. EKF dead-reckons.
  *                Transitions:
- *                  - VINS resumes (passes sanity) → ACTIVE (anchor preserved
- *                    so the drone re-acquires the same coordinate system).
- *                  - Drone is disarmed → PRE_INIT (anchor cleared).
+ *                  - VINS resumes (passes sanity) → ACTIVE
+ *                  - Drone is disarmed → PRE_INIT
  *
  * Sanity check: combined velocity + acceleration test.
  *   Velocity  > max_speed  → hard divergence, immediate DROPOUT.
@@ -69,9 +61,6 @@ public:
         , last_odom_time_(0)
         , have_prev_pos_(false)
         , have_prev_vel_(false)
-        , have_anchor_(false)
-        , anchor_pos_(Eigen::Vector3d::Zero())
-        , anchor_yaw_(0.0)
     {
         ros::NodeHandle pnh("~");
         pnh.param("max_accel",    max_accel_,    40.0);
@@ -219,71 +208,6 @@ private:
         viol_times_.clear();
     }
 
-    // Extract yaw (rotation around world Z) from a quaternion. Standard
-    // yaw-pitch-roll decomposition, robust at all orientations except the
-    // pitch=±90° singularity which a multirotor never reaches.
-    static double yawFromQuat(double w, double x, double y, double z)
-    {
-        return std::atan2(2.0 * (w * z + x * y),
-                          1.0 - 2.0 * (y * y + z * z));
-    }
-
-    // Apply the anchor offset to an incoming VINS pose so the published
-    // pose reads as if the drone took off at origin facing forward. We
-    // strip the anchor's yaw + xy/z position; roll & pitch pass through
-    // since they're observable from gravity (no drift between PRE_INIT's
-    // identity quaternion and any post-bootstrap VINS pose).
-    void applyAnchor(const geometry_msgs::Point  &in_pos,
-                     const geometry_msgs::Quaternion &in_q,
-                     geometry_msgs::Point  &out_pos,
-                     geometry_msgs::Quaternion &out_q) const
-    {
-        if (!have_anchor_)
-        {
-            out_pos = in_pos;
-            out_q   = in_q;
-            return;
-        }
-
-        // R_z(-anchor_yaw) applied to (in - anchor_pos)
-        const double c = std::cos(-anchor_yaw_);
-        const double s = std::sin(-anchor_yaw_);
-        const double dx = in_pos.x - anchor_pos_.x();
-        const double dy = in_pos.y - anchor_pos_.y();
-        out_pos.x = c * dx - s * dy;
-        out_pos.y = s * dx + c * dy;
-        out_pos.z = in_pos.z - anchor_pos_.z();
-
-        // Quaternion left-multiplication by yaw-only inverse:
-        //   q_yaw_inv = (cos(-yaw/2), 0, 0, sin(-yaw/2))
-        // out_q = q_yaw_inv * in_q
-        const double half = -anchor_yaw_ * 0.5;
-        const double qw =  std::cos(half);
-        const double qz =  std::sin(half);
-        // Hamilton product of (qw, 0, 0, qz) * (in_q.w, in_q.x, in_q.y, in_q.z):
-        out_q.w = qw * in_q.w - qz * in_q.z;
-        out_q.x = qw * in_q.x - qz * in_q.y;
-        out_q.y = qw * in_q.y + qz * in_q.x;
-        out_q.z = qw * in_q.z + qz * in_q.w;
-    }
-
-    // Rotate a linear-velocity vector by -anchor_yaw (twist lives in the
-    // vision world frame; the yaw shift carries through). Z untouched.
-    void applyAnchorTwist(const geometry_msgs::Vector3 &in_v,
-                          geometry_msgs::Vector3 &out_v) const
-    {
-        if (!have_anchor_)
-        {
-            out_v = in_v;
-            return;
-        }
-        const double c = std::cos(-anchor_yaw_);
-        const double s = std::sin(-anchor_yaw_);
-        out_v.x = c * in_v.x - s * in_v.y;
-        out_v.y = s * in_v.x + c * in_v.y;
-        out_v.z = in_v.z;
-    }
-
     // ── Callbacks ─────────────────────────────────────────────────
     void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
@@ -331,27 +255,6 @@ private:
                 prev_state = state_;
                 state_ = State::ACTIVE;
                 transition_to_active = true;
-
-                // Capture anchor on the FIRST entry into ACTIVE (i.e.
-                // coming from PRE_INIT). When recovering from DROPOUT
-                // we deliberately keep the existing anchor — VINS is
-                // still in the same internal world frame, so reusing
-                // the anchor preserves coordinate continuity.
-                if (prev_state == State::PRE_INIT)
-                {
-                    anchor_pos_ = Eigen::Vector3d(msg->pose.pose.position.x,
-                                                   msg->pose.pose.position.y,
-                                                   msg->pose.pose.position.z);
-                    anchor_yaw_ = yawFromQuat(msg->pose.pose.orientation.w,
-                                              msg->pose.pose.orientation.x,
-                                              msg->pose.pose.orientation.y,
-                                              msg->pose.pose.orientation.z);
-                    have_anchor_ = true;
-                    ROS_INFO("vision_pose_bridge: anchor captured "
-                             "pos=[%.3f %.3f %.3f] yaw=%.3frad",
-                             anchor_pos_.x(), anchor_pos_.y(), anchor_pos_.z(),
-                             anchor_yaw_);
-                }
             }
             staged = last_pose_;
         }
@@ -404,14 +307,7 @@ private:
                     // — handled by dt > 0.5 in checkSanity, but cleaner
                     // to zero it here).
                     last_odom_time_ = 0;
-                    // Clear the anchor on disarm — next takeoff is a
-                    // logically new flight and re-anchors at its own
-                    // first valid VINS pose. Keeping a stale anchor
-                    // across an arm cycle would silently shift the
-                    // EKF's perceived position by whatever drift VINS
-                    // accumulated last flight.
-                    have_anchor_ = false;
-                    ROS_INFO("vision_pose_bridge: disarmed -> PRE_INIT (anchor cleared)");
+                    ROS_INFO("vision_pose_bridge: disarmed -> PRE_INIT");
                 }
                 else
                     do_publish_pose = false;
@@ -424,14 +320,8 @@ private:
             pose_out.header.frame_id = pose_frame_;
             if (state_ == State::ACTIVE)
             {
-                applyAnchor(last_pose_.pose.position,
-                            last_pose_.pose.orientation,
-                            pose_out.pose.position,
-                            pose_out.pose.orientation);
-                speed_out.header = last_twist_.header;
-                speed_out.header.frame_id = pose_frame_;
-                applyAnchorTwist(last_twist_.twist.linear, speed_out.twist.linear);
-                speed_out.twist.angular = last_twist_.twist.angular;
+                pose_out.pose = last_pose_.pose;
+                speed_out = last_twist_;
                 publish_speed_now = publish_speed_ && have_last_twist_;
             }
             else // PRE_INIT
@@ -485,13 +375,6 @@ private:
     geometry_msgs::PoseStamped  last_pose_;
     geometry_msgs::TwistStamped last_twist_;
     bool have_last_twist_ = false;
-
-    // Anchor: snapshot of the first VINS pose seen on PRE_INIT → ACTIVE.
-    // Outgoing pose has anchor_pos_ subtracted and anchor_yaw_ rotated out
-    // (see applyAnchor). Cleared on disarm; preserved across DROPOUT.
-    bool            have_anchor_;
-    Eigen::Vector3d anchor_pos_;
-    double          anchor_yaw_;
 };
 
 int main(int argc, char **argv)
