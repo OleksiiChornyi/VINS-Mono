@@ -211,10 +211,9 @@ private:
     // ── Callbacks ─────────────────────────────────────────────────
     void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
-        // Snapshot inputs under lock; sanity and decision-making done
-        // outside the lock window to avoid blocking publishers on the
-        // same mutex (5.8).
-        geometry_msgs::PoseStamped staged;
+        // Snapshot inputs under lock; logging done outside the lock so the
+        // publisher thread doesn't stall on it (5.8). transition_to_*
+        // flags carry the state change into the post-lock log section.
         bool transition_to_active = false;
         bool transition_to_dropout = false;
         State prev_state = State::PRE_INIT;
@@ -256,7 +255,6 @@ private:
                 state_ = State::ACTIVE;
                 transition_to_active = true;
             }
-            staged = last_pose_;
         }
 
         if (transition_to_dropout)
