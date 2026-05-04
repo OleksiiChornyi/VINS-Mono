@@ -12,15 +12,22 @@
          NOT need a separate `rosrun vision_pose_bridge` step. Bridge ROS
          params are exposed as launch args:
            bridge_rate, bridge_max_accel, bridge_max_speed,
-           bridge_odom_timeout
+           bridge_odom_timeout, bridge_yaw_offset_deg
     -->
     <arg name="config_path" default="$(find feature_tracker)/../config/rpi/rpi.yaml" />
     <arg name="vins_path"   default="$(find feature_tracker)/../config/../" />
 
-    <arg name="bridge_rate"          default="10.0" />
-    <arg name="bridge_max_accel"     default="40.0" />
-    <arg name="bridge_max_speed"     default="30.0" />
-    <arg name="bridge_odom_timeout"  default="1.0" />
+    <arg name="bridge_rate"            default="10.0" />
+    <arg name="bridge_max_accel"       default="40.0" />
+    <arg name="bridge_max_speed"       default="30.0" />
+    <arg name="bridge_odom_timeout"    default="1.0" />
+    <!-- Constant yaw rotation (degrees) applied to every published vision
+         pose / orientation / linear twist. Compensates for the camera
+         mount yaw vs. the ArduPilot body frame. For this RPi setup
+         (downward camera, optical X axis along the drone side rather than
+         forward) the observed offset is ~90°. Set to 0 to disable; flip
+         sign or use 180 if your mount has the camera rotated differently. -->
+    <arg name="bridge_yaw_offset_deg"  default="90.0" />
 
     <node name="feature_tracker" pkg="feature_tracker" type="feature_tracker" output="log">
         <param name="config_file" type="string" value="$(arg config_path)" />
@@ -41,9 +48,10 @@
     </node>
 
     <node name="vision_pose_bridge" pkg="vins_estimator" type="vision_pose_bridge" output="screen">
-        <param name="rate"         type="double" value="$(arg bridge_rate)" />
-        <param name="max_accel"    type="double" value="$(arg bridge_max_accel)" />
-        <param name="max_speed"    type="double" value="$(arg bridge_max_speed)" />
-        <param name="odom_timeout" type="double" value="$(arg bridge_odom_timeout)" />
+        <param name="rate"           type="double" value="$(arg bridge_rate)" />
+        <param name="max_accel"      type="double" value="$(arg bridge_max_accel)" />
+        <param name="max_speed"      type="double" value="$(arg bridge_max_speed)" />
+        <param name="odom_timeout"   type="double" value="$(arg bridge_odom_timeout)" />
+        <param name="yaw_offset_deg" type="double" value="$(arg bridge_yaw_offset_deg)" />
     </node>
 </launch>
