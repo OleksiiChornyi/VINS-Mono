@@ -49,11 +49,13 @@
  *   ~pose_frame      frame_id for the outgoing PoseStamped (default "odom")
  *   ~publish_speed   publish /mavros/vision_speed/twist (default true)
  *   ~yaw_offset_deg  constant yaw rotation [deg] applied to the published
- *                    pose / orientation / linear twist before forwarding to
- *                    MAVROS. Compensates for the camera mount yaw versus
- *                    the autopilot body frame (default 0). Positive values
- *                    rotate the published frame counter-clockwise viewed
- *                    from above (right-hand rule around world Z).
+ *                    orientation only. Compensates for the camera mount
+ *                    yaw versus the autopilot body frame (default 0).
+ *                    Position and linear velocity are forwarded unchanged
+ *                    — the VINS world frame XY is already aligned with
+ *                    the autopilot's NED/ENU XY in this setup. Positive
+ *                    values rotate yaw counter-clockwise viewed from
+ *                    above (right-hand rule around world Z).
  */
 
 class VisionPoseBridge
@@ -78,13 +80,15 @@ public:
         pnh.param("rate", rate, 10.0);
         double yaw_offset_deg;
         pnh.param("yaw_offset_deg", yaw_offset_deg, 0.0);
-        // Pre-compute the yaw-rotation cos/sin and the half-angle quaternion
-        // components (qw, qz around Z) once at startup. The hot path uses
-        // only these scalars — no quaternion / matrix construction per
-        // outgoing pose.
+        // Wrap to (-180, 180] so cos/sin stay well-conditioned regardless
+        // of how the user specified the offset (e.g. 270 == -90).
+        yaw_offset_deg = std::fmod(yaw_offset_deg + 180.0, 360.0);
+        if (yaw_offset_deg < 0) yaw_offset_deg += 360.0;
+        yaw_offset_deg -= 180.0;
+        // Half-angle quaternion components (qw, qz around Z), computed
+        // once at startup. The hot path uses only these scalars — no
+        // quaternion / matrix construction per outgoing pose.
         const double yaw_offset_rad = yaw_offset_deg * M_PI / 180.0;
-        yaw_cos_      = std::cos(yaw_offset_rad);
-        yaw_sin_      = std::sin(yaw_offset_rad);
         yaw_q_w_      = std::cos(yaw_offset_rad * 0.5);
         yaw_q_z_      = std::sin(yaw_offset_rad * 0.5);
         apply_yaw_    = (std::fabs(yaw_offset_deg) > 1e-6);
@@ -227,50 +231,41 @@ private:
         viol_times_.clear();
     }
 
-    // Apply the configured yaw_offset to a pose: rotate xy position and
-    // left-multiply orientation quaternion by the yaw-only quaternion.
-    // Compensates for camera-mount yaw versus the autopilot body frame
-    // (e.g. a downward camera with optical X axis pointing along the
-    // drone's left/right side rather than forward gives a fixed 90°
-    // offset on every published yaw).
+    // Apply the configured yaw_offset to a pose: position passes through
+    // unchanged, only the orientation quaternion is left-multiplied by
+    // the yaw-only quaternion. Compensates for the camera-mount yaw
+    // versus the autopilot body frame (e.g. when AHRS yaw differs from
+    // the published VINS yaw by a constant offset while error_rp ≈ 0
+    // and the position/velocity axes are already correctly aligned).
     void applyYawOffset(const geometry_msgs::Pose &in,
                         geometry_msgs::Pose &out) const
     {
+        out.position = in.position;
         if (!apply_yaw_)
         {
-            out = in;
+            out.orientation = in.orientation;
             return;
         }
-        // Position: R_z(θ) · p
-        out.position.x = yaw_cos_ * in.position.x - yaw_sin_ * in.position.y;
-        out.position.y = yaw_sin_ * in.position.x + yaw_cos_ * in.position.y;
-        out.position.z = in.position.z;
         // Orientation: q_offset (yaw-only) · q_in, Hamilton product
         // q_offset = (yaw_q_w_, 0, 0, yaw_q_z_)
         const double w = yaw_q_w_, z = yaw_q_z_;
         const double iw = in.orientation.w, ix = in.orientation.x;
         const double iy = in.orientation.y, iz = in.orientation.z;
-        out.orientation.w = w * iw - z * iz;
-        out.orientation.x = w * ix - z * iy;
-        out.orientation.y = w * iy + z * ix;
-        out.orientation.z = w * iz + z * iw;
-    }
-
-    // Apply yaw_offset to a twist: linear velocity rotates with the
-    // world-frame transform; angular velocity is body-frame so it
-    // passes through unchanged.
-    void applyYawOffsetTwist(const geometry_msgs::Twist &in,
-                             geometry_msgs::Twist &out) const
-    {
-        if (!apply_yaw_)
+        double ow = w * iw - z * iz;
+        double ox = w * ix - z * iy;
+        double oy = w * iy + z * ix;
+        double oz = w * iz + z * iw;
+        // Renormalize to absorb any FP drift; q_offset and q_in are unit
+        // quaternions so this is a near-no-op but cheap insurance.
+        const double n = std::sqrt(ow*ow + ox*ox + oy*oy + oz*oz);
+        if (n > 1e-9)
         {
-            out = in;
-            return;
+            ow /= n; ox /= n; oy /= n; oz /= n;
         }
-        out.linear.x = yaw_cos_ * in.linear.x - yaw_sin_ * in.linear.y;
-        out.linear.y = yaw_sin_ * in.linear.x + yaw_cos_ * in.linear.y;
-        out.linear.z = in.linear.z;
-        out.angular = in.angular;
+        out.orientation.w = ow;
+        out.orientation.x = ox;
+        out.orientation.y = oy;
+        out.orientation.z = oz;
     }
 
     // ── Callbacks ─────────────────────────────────────────────────
@@ -384,9 +379,12 @@ private:
             if (state_ == State::ACTIVE)
             {
                 applyYawOffset(last_pose_.pose, pose_out.pose);
+                // Linear/angular twist forwarded as-is — the user
+                // observed correct XY behaviour pre-yaw-offset, so the
+                // velocity axes don't need rotating.
                 speed_out.header = last_twist_.header;
                 speed_out.header.frame_id = pose_frame_;
-                applyYawOffsetTwist(last_twist_.twist, speed_out.twist);
+                speed_out.twist = last_twist_.twist;
                 publish_speed_now = publish_speed_ && have_last_twist_;
             }
             else // PRE_INIT
@@ -442,10 +440,9 @@ private:
     bool have_last_twist_ = false;
 
     // Pre-computed yaw-offset transform (see applyYawOffset). Held as
-    // scalars, not as a quaternion / matrix, so the hot path costs only
-    // four multiplies + adds per outgoing pose component.
+    // scalar half-angle quaternion components so the hot path is just
+    // a Hamilton product on the orientation quaternion.
     bool   apply_yaw_;
-    double yaw_cos_, yaw_sin_;     // R_z(θ) — applied to position / linear-twist xy
     double yaw_q_w_, yaw_q_z_;     // half-angle quaternion components for orientation
 };
 
