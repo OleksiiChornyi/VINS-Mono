@@ -21,13 +21,13 @@
     <arg name="bridge_max_accel"       default="40.0" />
     <arg name="bridge_max_speed"       default="30.0" />
     <arg name="bridge_odom_timeout"    default="1.0" />
-    <!-- Constant yaw rotation (degrees) applied to every published vision
-         pose / orientation / linear twist. Compensates for the camera
-         mount yaw vs. the ArduPilot body frame. For this RPi setup
-         (downward camera, optical X axis along the drone side rather than
-         forward) the observed offset is ~90°. Set to 0 to disable; flip
-         sign or use 180 if your mount has the camera rotated differently. -->
-    <arg name="bridge_yaw_offset_deg"  default="90.0" />
+    <!-- Constant yaw rotation (degrees) applied ONLY to the published
+         orientation quaternion. Position and linear twist pass through
+         unchanged — they were already correct against the autopilot.
+         For this RPi setup the AHRS yaw was offset by ~+1.57 rad (90°)
+         vs. the VINS yaw with error_rp ≈ 0, so we apply -90° to bring
+         them into agreement. Set to 0 to disable. -->
+    <arg name="bridge_yaw_offset_deg"  default="-90.0" />
 
     <node name="feature_tracker" pkg="feature_tracker" type="feature_tracker" output="log">
         <param name="config_file" type="string" value="$(arg config_path)" />
