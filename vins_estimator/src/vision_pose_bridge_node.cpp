@@ -42,20 +42,12 @@
  *   /vins_bridge/pose             — mirror (telemetry / debug)
  *
  * Parameters (ROS):
- *   ~odom_timeout    seconds without data before DROPOUT (default 1.0)
- *   ~rate            publish rate Hz (default 10.0)
- *   ~max_accel       per-sample acceleration warn cap  [m/s²] (default 40.0)
- *   ~max_speed       hard divergence speed cap         [m/s] (default 30.0)
- *   ~pose_frame      frame_id for the outgoing PoseStamped (default "odom")
- *   ~publish_speed   publish /mavros/vision_speed/twist (default true)
- *   ~yaw_offset_deg  constant yaw rotation [deg] applied to the published
- *                    orientation only. Compensates for the camera mount
- *                    yaw versus the autopilot body frame (default 0).
- *                    Position and linear velocity are forwarded unchanged
- *                    — the VINS world frame XY is already aligned with
- *                    the autopilot's NED/ENU XY in this setup. Positive
- *                    values rotate yaw counter-clockwise viewed from
- *                    above (right-hand rule around world Z).
+ *   ~odom_timeout  seconds without data before DROPOUT (default 1.0)
+ *   ~rate          publish rate Hz (default 10.0)
+ *   ~max_accel     per-sample acceleration warn cap  [m/s²] (default 40.0)
+ *   ~max_speed     hard divergence speed cap         [m/s] (default 30.0)
+ *   ~pose_frame    frame_id for the outgoing PoseStamped (default "odom")
+ *   ~publish_speed publish /mavros/vision_speed/twist (default true)
  */
 
 class VisionPoseBridge
@@ -78,20 +70,6 @@ public:
         pnh.param("publish_speed", publish_speed_, true);
         double rate;
         pnh.param("rate", rate, 10.0);
-        double yaw_offset_deg;
-        pnh.param("yaw_offset_deg", yaw_offset_deg, 0.0);
-        // Wrap to (-180, 180] so cos/sin stay well-conditioned regardless
-        // of how the user specified the offset (e.g. 270 == -90).
-        yaw_offset_deg = std::fmod(yaw_offset_deg + 180.0, 360.0);
-        if (yaw_offset_deg < 0) yaw_offset_deg += 360.0;
-        yaw_offset_deg -= 180.0;
-        // Half-angle quaternion components (qw, qz around Z), computed
-        // once at startup. The hot path uses only these scalars — no
-        // quaternion / matrix construction per outgoing pose.
-        const double yaw_offset_rad = yaw_offset_deg * M_PI / 180.0;
-        yaw_q_w_      = std::cos(yaw_offset_rad * 0.5);
-        yaw_q_z_      = std::sin(yaw_offset_rad * 0.5);
-        apply_yaw_    = (std::fabs(yaw_offset_deg) > 1e-6);
 
         pub_mavros_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "/mavros/vision_pose/pose", 10);
@@ -111,9 +89,8 @@ public:
             ros::Duration(1.0 / rate),
             &VisionPoseBridge::timerCallback, this);
 
-        ROS_INFO("vision_pose_bridge: rate=%.0fHz frame=%s speed=%s yaw_offset=%.1f°",
-                 rate, pose_frame_.c_str(), publish_speed_ ? "on" : "off",
-                 yaw_offset_deg);
+        ROS_INFO("vision_pose_bridge: rate=%.0fHz frame=%s speed=%s",
+                 rate, pose_frame_.c_str(), publish_speed_ ? "on" : "off");
         ROS_INFO("  max_accel=%.1f m/s² max_speed=%.1f m/s timeout=%.1fs",
                  max_accel_, max_speed_, odom_timeout_);
     }
@@ -231,43 +208,6 @@ private:
         viol_times_.clear();
     }
 
-    // Apply the configured yaw_offset to a pose: position passes through
-    // unchanged, only the orientation quaternion is left-multiplied by
-    // the yaw-only quaternion. Compensates for the camera-mount yaw
-    // versus the autopilot body frame (e.g. when AHRS yaw differs from
-    // the published VINS yaw by a constant offset while error_rp ≈ 0
-    // and the position/velocity axes are already correctly aligned).
-    void applyYawOffset(const geometry_msgs::Pose &in,
-                        geometry_msgs::Pose &out) const
-    {
-        out.position = in.position;
-        if (!apply_yaw_)
-        {
-            out.orientation = in.orientation;
-            return;
-        }
-        // Orientation: q_offset (yaw-only) · q_in, Hamilton product
-        // q_offset = (yaw_q_w_, 0, 0, yaw_q_z_)
-        const double w = yaw_q_w_, z = yaw_q_z_;
-        const double iw = in.orientation.w, ix = in.orientation.x;
-        const double iy = in.orientation.y, iz = in.orientation.z;
-        double ow = w * iw - z * iz;
-        double ox = w * ix - z * iy;
-        double oy = w * iy + z * ix;
-        double oz = w * iz + z * iw;
-        // Renormalize to absorb any FP drift; q_offset and q_in are unit
-        // quaternions so this is a near-no-op but cheap insurance.
-        const double n = std::sqrt(ow*ow + ox*ox + oy*oy + oz*oz);
-        if (n > 1e-9)
-        {
-            ow /= n; ox /= n; oy /= n; oz /= n;
-        }
-        out.orientation.w = ow;
-        out.orientation.x = ox;
-        out.orientation.y = oy;
-        out.orientation.z = oz;
-    }
-
     // ── Callbacks ─────────────────────────────────────────────────
     void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
@@ -378,13 +318,8 @@ private:
             pose_out.header.frame_id = pose_frame_;
             if (state_ == State::ACTIVE)
             {
-                applyYawOffset(last_pose_.pose, pose_out.pose);
-                // Linear/angular twist forwarded as-is — the user
-                // observed correct XY behaviour pre-yaw-offset, so the
-                // velocity axes don't need rotating.
-                speed_out.header = last_twist_.header;
-                speed_out.header.frame_id = pose_frame_;
-                speed_out.twist = last_twist_.twist;
+                pose_out.pose = last_pose_.pose;
+                speed_out = last_twist_;
                 publish_speed_now = publish_speed_ && have_last_twist_;
             }
             else // PRE_INIT
@@ -438,12 +373,6 @@ private:
     geometry_msgs::PoseStamped  last_pose_;
     geometry_msgs::TwistStamped last_twist_;
     bool have_last_twist_ = false;
-
-    // Pre-computed yaw-offset transform (see applyYawOffset). Held as
-    // scalar half-angle quaternion components so the hot path is just
-    // a Hamilton product on the orientation quaternion.
-    bool   apply_yaw_;
-    double yaw_q_w_, yaw_q_z_;     // half-angle quaternion components for orientation
 };
 
 int main(int argc, char **argv)
