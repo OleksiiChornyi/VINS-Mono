@@ -15,7 +15,6 @@
  *
  * States:
  *   PRE_INIT  →  Publishes (0,0,0) + identity orientation at ~rate Hz.
- *                Allows arm in PosHold.
  *                Transition: VINS odometry arrives (passes sanity) → ACTIVE
  *
  *   ACTIVE    →  Forwards VINS position + orientation.
@@ -314,16 +313,26 @@ private:
             if (!do_publish_pose)
                 return;
 
-            pose_out.header.stamp = ros::Time::now();
             pose_out.header.frame_id = pose_frame_;
             if (state_ == State::ACTIVE)
             {
+                // Preserve the original VINS measurement time. ros::Time::now()
+                // would mark the pose as if it were captured at publish time,
+                // hiding the (~50–150 ms) VINS pipeline latency from the
+                // ArduPilot EKF — the EKF would integrate stale data as
+                // current and oscillate. Stamping with the source time lets
+                // the EKF compensate properly.
+                pose_out.header.stamp = last_pose_.header.stamp;
                 pose_out.pose = last_pose_.pose;
                 speed_out = last_twist_;
+                speed_out.header.stamp = last_twist_.header.stamp;
                 publish_speed_now = publish_speed_ && have_last_twist_;
             }
             else // PRE_INIT
             {
+                // PRE_INIT pose is a synthetic constant; ::now() is correct
+                // here because there is no real measurement time to preserve.
+                pose_out.header.stamp = ros::Time::now();
                 pose_out.pose.position.x = 0;
                 pose_out.pose.position.y = 0;
                 pose_out.pose.position.z = 0;
